@@ -5,6 +5,7 @@
 #include "hgp/perception_planner.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <queue>
@@ -349,11 +350,18 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   came[start_key] = {-1, nullptr};
   unpack[start_key] = {six, siy, sih, 0};
 
+  // Best (closest-to-goal) node seen, for partial-path recovery on a resource
+  // limit or an exhausted open set -- mirrors MIGHTY's grid A* best_node behavior.
+  const double start_h = hFn(six, siy);
+  int64_t best_key = start_key;
+  double best_h = start_h;
+
   std::priority_queue<OpenNode, std::vector<OpenNode>, std::greater<OpenNode>> open;
-  open.push({hFn(six, siy), 0.0, start_key});
+  open.push({start_h, 0.0, start_key});
 
   int64_t goal_key = -1;
   int expanded = 0;
+  const auto t_start = std::chrono::steady_clock::now();
 
   while (!open.empty()) {
     const OpenNode top = open.top();
@@ -365,9 +373,24 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
     const int ix = s[0], iy = s[1], ih = s[2], mv = s[3];
     ++expanded;
 
+    // Resource guards (match MIGHTY's grid A*): on hitting either limit, stop and
+    // recover the best partial path found so far (handled after the loop).
+    if (P.max_expand > 0 && expanded >= P.max_expand) break;
+    if (P.timeout_ms > 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t_start)
+                .count() >= P.timeout_ms) {
+      break;
+    }
+
     double wx, wy;
     belief.gridToWorld(ix, iy, wx, wy);
-    if (std::hypot(goal_x - wx, goal_y - wy) <= P.goal_tol) {
+    const double h_cur = std::hypot(goal_x - wx, goal_y - wy);
+    if (h_cur < best_h) {  // track closest-to-goal node for partial recovery
+      best_h = h_cur;
+      best_key = st;
+    }
+    if (h_cur <= P.goal_tol) {
       goal_key = st;
       break;
     }
@@ -448,14 +471,25 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   }
 
   res.expanded = expanded;
-  if (goal_key < 0) {
-    res.ok = false;
-    return res;
+
+  // Terminal node: the goal if reached, else the best (closest-to-goal) node for a
+  // partial path (MIGHTY best_node behavior). If nothing improved on the start
+  // (open set exhausted / limit hit with zero progress), report failure so the
+  // caller can fall back to the guarded grid search.
+  int64_t terminal = goal_key;
+  bool partial = false;
+  if (terminal < 0) {
+    if (best_key == start_key) {
+      res.ok = false;
+      return res;
+    }
+    terminal = best_key;
+    partial = true;
   }
 
-  // --- reconstruct pose path ---
+  // --- reconstruct pose path from the terminal node ---
   std::vector<int64_t> chain;
-  for (int64_t st = goal_key; st != -1; st = came[st].prev) chain.push_back(st);
+  for (int64_t st = terminal; st != -1; st = came[st].prev) chain.push_back(st);
   std::reverse(chain.begin(), chain.end());
 
   for (int64_t st : chain) {
@@ -464,8 +498,9 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
     belief.gridToWorld(s[0], s[1], wx, wy);
     res.states.push_back({wx, wy, s[2] * dth_rad});
   }
-  res.cost = g[goal_key];
+  res.cost = g[terminal];
   res.ok = true;
+  res.partial = partial;
 
   // --- audit: unknown swept cells with no 2-pose coverage credit ---
   int blind = 0;

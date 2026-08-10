@@ -102,6 +102,11 @@ struct PerceptionParams {
   bool use_coverage_rule = true;   ///< false -> naive plan-through-unknown baseline
   int back_projection_steps = 5;   ///< ladder depth for the virtual-previous-pose credit
   double back_projection_step = 0.25;  ///< ladder spacing [m]
+  // Resource guards (mirror MIGHTY's grid A*): on hitting either limit, or on the
+  // open set emptying before the goal, the search returns the partial path to the
+  // best (closest-to-goal) node reached rather than failing outright.
+  int max_expand = 10000;          ///< max A* expansions; <= 0 means unlimited
+  int timeout_ms = 1000;           ///< wall-clock planning budget [ms]; <= 0 means none
 };
 
 // ---------------------------------------------------------------------------
@@ -146,6 +151,7 @@ class Visibility {
 
 struct PerceptionPlanResult {
   bool ok = false;
+  bool partial = false;   ///< true if `states` is a best-node partial path (goal not reached)
   std::vector<std::array<double, 3>> states;  ///< dense pose path (x, y, theta)
   double cost = 0.0;
   int expanded = 0;

@@ -730,9 +730,13 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
     heading = std::atan2(goal(1) - start(1), goal(0) - start(0));
   }
 
-  // Keep the lattice resolution aligned with the belief grid so cell math matches.
+  // Keep the lattice resolution aligned with the belief grid so cell math matches,
+  // and hand the perception search the same resource guards as the grid A* (so it
+  // times out / caps expansions and recovers a best-node partial path too).
   hgp::PerceptionParams P = perception_params_;
   P.res = perception_belief_->resolution();
+  P.max_expand = max_expand_;
+  P.timeout_ms = hgp_timeout_duration_ms_;
 
   hgp::PerceptionPlanResult r = hgp::planPerceptionAware(
       *perception_belief_, *perception_sensor_, P, start(0), start(1), heading, goal(0), goal(1));
@@ -753,8 +757,8 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   final_g = r.cost;
   status_ = 0;
   if (planner_verbose_) {
-    printf("perception-aware A*: %zu states, cost=%.3f, expanded=%d, blind_unknown=%d\n",
-           r.states.size(), r.cost, r.expanded, r.blind_unknown_entries);
+    printf("perception-aware A*: %zu states, cost=%.3f, expanded=%d, blind_unknown=%d, partial=%d\n",
+           r.states.size(), r.cost, r.expanded, r.blind_unknown_entries, (int)r.partial);
   }
   return true;
 }
