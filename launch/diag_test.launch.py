@@ -75,7 +75,18 @@ def launch_setup(context, *args, **kwargs):
         condition=None,
     )
 
-    nodes = [mighty_node, diag_pub]
+    # Mid-360 coverage overlay: draws the elliptical far envelope + near/blind ring
+    # at the robot pose (follows /state). Publishes MarkerArray on <ns>/mid360_fov.
+    fov_viz = Node(
+        package="mighty",
+        executable="mid360_fov_viz.py",
+        name="mid360_fov_viz",
+        namespace=namespace,
+        output="screen",
+        parameters=[{"frame_id": "map", "use_state": True}],
+    )
+
+    nodes = [mighty_node, diag_pub, fov_viz]
     if use_rviz:
         nodes.append(rviz_node)
     return nodes

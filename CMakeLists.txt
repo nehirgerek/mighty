@@ -171,6 +171,7 @@ install(PROGRAMS
   scripts/frame_align_publisher.py
   scripts/formation_viz_node.py
   scripts/diag_grid_test.py
+  scripts/mid360_fov_viz.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
