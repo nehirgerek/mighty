@@ -346,6 +346,24 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
   raw_path_.clear();
   status_ = 0;
 
+  // Perception-aware routing: when enabled (ground-robot 2D + a tristate belief),
+  // the global path is produced by the sensor-coverage lattice A* instead of the
+  // grid A*/JPS below. Falls through to the standard search if it can't produce a
+  // coverage-feasible path, so behavior degrades gracefully rather than failing.
+  if (perceptionAwareActive()) {
+    if (planPerceptionAware(start, start_vel, goal, final_g)) {
+      return true;
+    }
+    if (planner_verbose_) {
+      printf(ANSI_COLOR_YELLOW
+             "perception-aware plan found no coverage-feasible path; "
+             "falling back to grid search\n" ANSI_COLOR_RESET);
+    }
+    path_.clear();
+    raw_path_.clear();
+    status_ = 0;
+  }
+
   Veci<3> start_int = map_util_->floatToInt(start);
 
   // In 2D mode, validate against 2D map instead of 3D map (ground points would block start/goal)
@@ -693,3 +711,50 @@ double HGPPlanner::getCheckPathTime() { return hgp_check_path_time_; }
 double HGPPlanner::getDynamicAstarTime() { return hgp_dynamic_astar_time_; }
 
 double HGPPlanner::getRecoverPathTime() { return hgp_recover_path_time_; }
+
+// ---------------------------------------------------------------------------
+// Perception-aware lattice A* routing (ground robot 2D). See
+// hgp/perception_planner.hpp for the coverage invariant. Bypasses the LoS/
+// smoothing pipeline: the coverage-feasible lattice path is used directly.
+// ---------------------------------------------------------------------------
+bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_vel,
+                                     const Vecf<3>& goal, double& final_g) {
+  if (!perception_belief_ || !perception_sensor_) return false;
+
+  // Start heading: prefer the velocity direction; else aim from start toward goal.
+  double heading;
+  const double vx = start_vel(0), vy = start_vel(1);
+  if (std::hypot(vx, vy) > 1e-6) {
+    heading = std::atan2(vy, vx);
+  } else {
+    heading = std::atan2(goal(1) - start(1), goal(0) - start(0));
+  }
+
+  // Keep the lattice resolution aligned with the belief grid so cell math matches.
+  hgp::PerceptionParams P = perception_params_;
+  P.res = perception_belief_->resolution();
+
+  hgp::PerceptionPlanResult r = hgp::planPerceptionAware(
+      *perception_belief_, *perception_sensor_, P, start(0), start(1), heading, goal(0), goal(1));
+
+  if (!r.ok || r.states.empty()) return false;
+
+  // Convert (x, y, theta) poses -> vec_Vecf<3> path at the start's z plane.
+  const double z = start(2);
+  raw_path_.clear();
+  raw_path_.reserve(r.states.size());
+  for (const auto& s : r.states) {
+    raw_path_.emplace_back(Vec3f(s[0], s[1], z));
+  }
+  // Pin the endpoints exactly to the requested start/goal xy for downstream use.
+  raw_path_.front() = Vec3f(start(0), start(1), z);
+  raw_path_.back() = Vec3f(goal(0), goal(1), z);
+  path_ = raw_path_;
+  final_g = r.cost;
+  status_ = 0;
+  if (planner_verbose_) {
+    printf("perception-aware A*: %zu states, cost=%.3f, expanded=%d, blind_unknown=%d\n",
+           r.states.size(), r.cost, r.expanded, r.blind_unknown_entries);
+  }
+  return true;
+}
