@@ -756,9 +756,17 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   path_ = raw_path_;
   final_g = r.cost;
   status_ = 0;
-  if (planner_verbose_) {
-    printf("perception-aware A*: %zu states, cost=%.3f, expanded=%d, blind_unknown=%d, partial=%d\n",
-           r.states.size(), r.cost, r.expanded, r.blind_unknown_entries, (int)r.partial);
+  // Always surface a max-expansion cap hit (so it can be monitored for tuning);
+  // full stop-reason logging under planner_verbose_.
+  if (r.stop_reason == hgp::StopReason::MAX_EXPAND) {
+    printf(ANSI_COLOR_YELLOW
+           "perception-aware A*: hit max_expand=%d (expanded=%d) -> returning %s path "
+           "(blind_unknown=%d). Consider raising the perception max_expand.\n" ANSI_COLOR_RESET,
+           P.max_expand, r.expanded, r.partial ? "PARTIAL" : "full", r.blind_unknown_entries);
+  } else if (planner_verbose_) {
+    printf("perception-aware A*: stop=%s states=%zu cost=%.3f expanded=%d blind_unknown=%d partial=%d\n",
+           hgp::stopReasonStr(r.stop_reason), r.states.size(), r.cost, r.expanded,
+           r.blind_unknown_entries, (int)r.partial);
   }
   return true;
 }

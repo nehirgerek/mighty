@@ -25,6 +25,17 @@ inline double wrapPi(double a) {
 }
 }  // namespace
 
+const char* stopReasonStr(StopReason r) {
+  switch (r) {
+    case StopReason::GOAL: return "GOAL";
+    case StopReason::MAX_EXPAND: return "MAX_EXPAND";
+    case StopReason::TIMEOUT: return "TIMEOUT";
+    case StopReason::EXHAUSTED: return "EXHAUSTED";
+    case StopReason::NO_PROGRESS: return "NO_PROGRESS";
+  }
+  return "?";
+}
+
 // ===========================================================================
 // AnnulusSensor
 // ===========================================================================
@@ -131,6 +142,15 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P) {
   std::vector<std::vector<Primitive>> prims(NH);
   const int n_samp = std::max(8, static_cast<int>(std::llround(P.prim_len / (P.res * 0.4))));
 
+  // Robot footprint stencil (disc of robot_radius, in cells): used to expand each
+  // centerline sweep cell so the coverage invariant covers the WHOLE footprint,
+  // not just the centerline.
+  const int frad = std::max(0, static_cast<int>(std::ceil(P.robot_radius / P.res)));
+  std::vector<std::array<int, 2>> fp_stencil;
+  for (int dy = -frad; dy <= frad; ++dy)
+    for (int dx = -frad; dx <= frad; ++dx)
+      if (dx * dx + dy * dy <= frad * frad) fp_stencil.push_back({dx, dy});
+
   for (int hh = 0; hh < NH; ++hh) {
     const double th0 = hh * dth_rad;
 
@@ -162,6 +182,7 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P) {
       pr.end_dy = end_dy;
 
       std::vector<std::array<int, 2>> sweep;
+      std::vector<std::array<double, 3>> spos;  // continuous (x, y, theta) samples
       std::unordered_map<uint64_t, char> seen;
       auto push_cell = [&](int cxi, int cyi) {
         const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(cxi)) << 32) |
@@ -180,6 +201,7 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P) {
           const double x = u * Px, y = u * Py;
           push_cell(static_cast<int>(std::floor(x / P.res + 0.5)),
                     static_cast<int>(std::floor(y / P.res + 0.5)));
+          spos.push_back({x, y, th0});
         }
       } else {
         const double Rt = c / (2.0 * std::sin(alpha));  // signed radius
@@ -191,9 +213,25 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P) {
           const double y = -Rt * (std::cos(th_u) - std::cos(th0));
           push_cell(static_cast<int>(std::floor(x / P.res + 0.5)),
                     static_cast<int>(std::floor(y / P.res + 0.5)));
+          spos.push_back({x, y, th_u});
         }
       }
+
+      // footprint-expanded swept set (dedup): coverage is enforced over this.
+      std::unordered_map<uint64_t, char> fpseen;
+      std::vector<std::array<int, 2>> fpsweep;
+      for (const auto& sc : sweep) {
+        for (const auto& st : fp_stencil) {
+          const int cx = sc[0] + st[0], cy = sc[1] + st[1];
+          const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32) |
+                               static_cast<uint32_t>(cy);
+          if (fpseen.emplace(key, 1).second) fpsweep.push_back({cx, cy});
+        }
+      }
+
       pr.sweep = std::move(sweep);
+      pr.footprint_sweep = std::move(fpsweep);
+      pr.sample_poses = std::move(spos);
       pr.cost = length + 5e-4 * std::abs(dth);  // epsilon tie-break per heading change
       pr.end_dx_m = Px;
       pr.end_dy_m = Py;
@@ -382,6 +420,7 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
 
   int64_t goal_key = -1;
   int expanded = 0;
+  StopReason stop = StopReason::EXHAUSTED;  // default: open set emptied
   const auto t_start = std::chrono::steady_clock::now();
 
   while (!open.empty()) {
@@ -396,11 +435,15 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
 
     // Resource guards (match MIGHTY's grid A*): on hitting either limit, stop and
     // recover the best partial path found so far (handled after the loop).
-    if (P.max_expand > 0 && expanded >= P.max_expand) break;
+    if (P.max_expand > 0 && expanded >= P.max_expand) {
+      stop = StopReason::MAX_EXPAND;
+      break;
+    }
     if (P.timeout_ms > 0 &&
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t_start)
                 .count() >= P.timeout_ms) {
+      stop = StopReason::TIMEOUT;
       break;
     }
 
@@ -413,6 +456,7 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
     }
     if (h_cur <= P.goal_tol) {
       goal_key = st;
+      stop = StopReason::GOAL;
       break;
     }
 
@@ -435,48 +479,59 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
         continue;
       }
 
-      // forward / arc primitive: collision + coverage checks
+      // forward / arc primitive:
+      //   (1) collision: centerline swept cells vs the robot_radius-inflated map
+      //       (centerline-vs-inflated == footprint-vs-raw occupied).
+      //   (2) coverage (Issue B): EVERY unknown cell in the footprint-expanded
+      //       sweep -- not just the centerline -- must be predicted-observable
+      //       before traversal.
       bool feasible = true;
-      int unk_cells = 0;
       for (const auto& off : pr.sweep) {
-        const int cix = ix + off[0], ciy = iy + off[1];
-        if (isBlocked(cix, ciy)) {
+        if (isBlocked(ix + off[0], iy + off[1])) {
           feasible = false;
           break;
         }
-        if (belief.isUnknown(cix, ciy)) {
-          ++unk_cells;
-          if (P.use_coverage_rule) {
-            bool ok = vis.visible(px, py, pth, cix, ciy);
-            if (!ok && mv) {
-              // ladder of back-projected poses along the incoming heading: every
-              // depth in (0, L] was genuinely occupied (mv=1), so crediting any is
-              // sound under the same alignment approximation as the virtual pose.
-              for (int k = 1; k <= P.back_projection_steps; ++k) {
-                const double dlt = P.back_projection_step * k;
-                const double bx = px - dlt * std::cos(pth);
-                const double by = py - dlt * std::sin(pth);
-                if (vis.visible(bx, by, pth, cix, ciy)) {
-                  ok = true;
-                  break;
-                }
-              }
-            }
-            if (!ok) {
-              feasible = false;
+      }
+      if (!feasible) continue;
+
+      int unk_cells = 0;
+      for (const auto& off : pr.footprint_sweep) {
+        const int cix = ix + off[0], ciy = iy + off[1];
+        if (!inBounds(cix, ciy)) {  // footprint off the known map -> can't observe it
+          feasible = false;
+          break;
+        }
+        if (!belief.isUnknown(cix, ciy)) continue;
+        ++unk_cells;
+        if (!P.use_coverage_rule) continue;
+        bool ok = vis.visible(px, py, pth, cix, ciy);
+        if (!ok && mv) {
+          // Back-projected virtual poses along the incoming heading. Only armed
+          // after a STRAIGHT primitive (see mv_after / Issue A), where the
+          // straight-history assumption behind this ladder actually holds.
+          for (int k = 1; k <= P.back_projection_steps; ++k) {
+            const double dlt = P.back_projection_step * k;
+            const double bx = px - dlt * std::cos(pth);
+            const double by = py - dlt * std::sin(pth);
+            if (vis.visible(bx, by, pth, cix, ciy)) {
+              ok = true;
               break;
             }
           }
+        }
+        if (!ok) {
+          feasible = false;
+          break;
         }
       }
       if (!feasible) continue;
 
       const int nih = ((ih + pr.dth) % NH + NH) % NH;
-      // The back-projection ladder assumes the incoming path was ~straight along
-      // the current heading; that holds within one heading bin. For coarse
-      // lattices (>45 deg steps) an arc breaks it, so only straights arm the ladder.
-      const int mv_after =
-          (pr.dth == 0 || dth_rad <= 45.0 * kPi / 180.0 + 1e-9) ? 1 : 0;
+      // Issue A (safety): the back-projection ladder reconstructs a STRAIGHT history
+      // behind the rover. After an arc the rover was never on that straight line, so
+      // crediting it would claim observation from a pose never occupied. Only a
+      // straight primitive may arm the ladder on the next expansion.
+      const int mv_after = (pr.dth == 0) ? 1 : 0;
       const int nix = ix + pr.end_dx, niy = iy + pr.end_dy;
       if (!inBounds(nix, niy)) continue;
       const int64_t nst = keyOf(nix, niy, nih, mv_after);
@@ -501,12 +556,14 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   bool partial = false;
   if (terminal < 0) {
     if (best_key == start_key) {
+      res.stop_reason = StopReason::NO_PROGRESS;
       res.ok = false;
       return res;
     }
     terminal = best_key;
     partial = true;
   }
+  res.stop_reason = (goal_key >= 0) ? StopReason::GOAL : stop;  // MAX_EXPAND/TIMEOUT/EXHAUSTED
 
   // --- reconstruct pose path from the terminal node ---
   std::vector<int64_t> chain;
@@ -523,38 +580,53 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   res.ok = true;
   res.partial = partial;
 
-  // --- audit: unknown swept cells with no 2-pose coverage credit ---
+  // --- INDEPENDENT audit (Issue C) --------------------------------------------
+  // Unlike the planner, this uses NO back-projection ladder and only the ACTUAL
+  // poses the rover occupied along the executed trajectory (reconstructed from each
+  // primitive's continuous sample_poses). For every unknown footprint cell a
+  // primitive sweeps, it must have been visible from some genuinely-earlier real
+  // pose. If the planner's ladder/moved approximation was unsound, this disagrees
+  // (blind > 0) instead of rubber-stamping it with the same assumption.
   int blind = 0;
+  auto node_pose = [&](int64_t key) {
+    const auto s = unpack[key];
+    double wx, wy;
+    belief.gridToWorld(s[0], s[1], wx, wy);
+    return std::array<double, 3>{wx, wy, s[2] * dth_rad};
+  };
+  std::vector<std::array<double, 3>> earlier_poses;  // real (wx, wy, wth), in order
+  earlier_poses.push_back(node_pose(chain[0]));
+
   for (size_t i = 1; i < chain.size(); ++i) {
     const Came& cm = came[chain[i]];
-    if (cm.prim == nullptr || cm.prim->kind == Primitive::TURN) continue;
     const auto sprev = unpack[chain[i - 1]];
-    double px, py;
-    belief.gridToWorld(sprev[0], sprev[1], px, py);
-    const double pth = sprev[2] * dth_rad;
-    const int mv = sprev[3];
-    for (const auto& off : cm.prim->sweep) {
-      const int cix = sprev[0] + off[0], ciy = sprev[1] + off[1];
-      if (!belief.isUnknown(cix, ciy)) continue;
-      bool ok = vis_audit.visible(px, py, pth, cix, ciy);
-      if (!ok && mv) {
-        for (int k = 1; k <= P.back_projection_steps; ++k) {
-          const double dlt = P.back_projection_step * k;
-          const double bx = px - dlt * std::cos(pth);
-          const double by = py - dlt * std::sin(pth);
-          if (vis_audit.visible(bx, by, pth, cix, ciy)) {
-            ok = true;
+    double pnx, pny;
+    belief.gridToWorld(sprev[0], sprev[1], pnx, pny);
+
+    if (cm.prim != nullptr && cm.prim->kind != Primitive::TURN) {
+      for (const auto& off : cm.prim->footprint_sweep) {
+        const int cix = sprev[0] + off[0], ciy = sprev[1] + off[1];
+        if (!belief.isUnknown(cix, ciy)) continue;
+        bool seen = false;
+        for (const auto& q : earlier_poses) {
+          if (vis_audit.visible(q[0], q[1], q[2], cix, ciy)) {  // no ladder
+            seen = true;
             break;
           }
         }
+        if (!seen) {
+          ++blind;
+          double bwx, bwy;
+          belief.gridToWorld(cix, ciy, bwx, bwy);
+          res.blind_cells.push_back({bwx, bwy});
+        }
       }
-      if (!ok) {
-        ++blind;
-        double bwx, bwy;
-        belief.gridToWorld(cix, ciy, bwx, bwy);
-        res.blind_cells.push_back({bwx, bwy});
-      }
+      // Append the primitive's actual continuous poses (world frame) to the history.
+      for (const auto& sp : cm.prim->sample_poses)
+        earlier_poses.push_back({pnx + sp[0], pny + sp[1], sp[2]});
     }
+    // Record arrival at chain[i] (also captures a turn's new-heading pose).
+    earlier_poses.push_back(node_pose(chain[i]));
   }
   res.blind_unknown_entries = blind;
   return res;

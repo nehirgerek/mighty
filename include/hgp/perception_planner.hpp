@@ -118,7 +118,16 @@ struct Primitive {
   Kind kind = FWD;
   int dth = 0;                    ///< heading change in bins
   int end_dx = 0, end_dy = 0;     ///< integer end cell offset
-  std::vector<std::array<int, 2>> sweep;  ///< swept cell offsets (dx, dy)
+  std::vector<std::array<int, 2>> sweep;  ///< centerline swept cell offsets (dx, dy)
+  ///< footprint-expanded swept cells: every cell within robot_radius of any
+  ///< centerline sweep cell (deduped). The coverage invariant is applied over
+  ///< THIS set so the whole robot footprint -- not just the centerline -- must
+  ///< have been observed before traversal.
+  std::vector<std::array<int, 2>> footprint_sweep;
+  ///< continuous sampled poses along the primitive, in the start-aligned frame
+  ///< (offset_x_m, offset_y_m, absolute_theta). Used by the independent audit to
+  ///< reconstruct the actual trajectory the rover follows (not a straight ladder).
+  std::vector<std::array<double, 3>> sample_poses;
   double cost = 0.0;
   double end_dx_m = 0.0, end_dy_m = 0.0, dtheta = 0.0;  ///< exact end pose (viz)
 };
@@ -170,13 +179,20 @@ class Visibility {
 // Planner entry
 // ---------------------------------------------------------------------------
 
+/** @brief Why the search stopped -- lets the caller log/monitor (e.g. distinguish
+ *  "hit the expansion cap" from "genuinely unreachable"). */
+enum class StopReason { GOAL, MAX_EXPAND, TIMEOUT, EXHAUSTED, NO_PROGRESS };
+const char* stopReasonStr(StopReason r);
+
 struct PerceptionPlanResult {
   bool ok = false;
   bool partial = false;   ///< true if `states` is a best-node partial path (goal not reached)
+  StopReason stop_reason = StopReason::EXHAUSTED;
   std::vector<std::array<double, 3>> states;  ///< dense pose path (x, y, theta)
   double cost = 0.0;
   int expanded = 0;
-  int blind_unknown_entries = 0;              ///< unknown cells entered w/o coverage credit
+  int blind_unknown_entries = 0;              ///< unknown footprint cells with no INDEPENDENT
+                                              ///< (ladder-free) earlier-pose observation (audit)
   std::vector<std::array<double, 2>> blind_cells;  ///< their world coords (audit)
 };
 
