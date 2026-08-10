@@ -290,6 +290,19 @@ class HGPPlanner {
   std::shared_ptr<hgp::SensorModel> perception_sensor_;
   hgp::PerceptionParams perception_params_;
 
+  // Telemetry from the last perception-aware plan() that returned true. A behavior
+  // layer can poll these to distinguish a full solution from a receding-horizon
+  // partial and to detect "stuck creeping" (repeated small-residual partials).
+  bool perception_last_partial_{false};       ///< true if the accepted path stopped short of the goal
+  double perception_last_residual_m_{0.0};     ///< distance [m] from the path end to the goal (0 if reached)
+
+  /** @return true if the last successful perception-aware plan was a partial
+   *  (goal-not-reached) receding-horizon path rather than a full solution. */
+  bool perceptionLastPartial() const { return perception_last_partial_; }
+  /** @return residual distance [m] from the last perception-aware path's end to the
+   *  goal (0 when the goal was reached). Meaningful only after plan() returned true. */
+  double perceptionLastResidualToGoal() const { return perception_last_residual_m_; }
+
   /** @brief Run the perception-aware lattice A* and fill path_/raw_path_.
    *  @return true on success (a coverage-feasible path to the goal was found). */
   bool planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf<3>& goal,

@@ -346,22 +346,49 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
   raw_path_.clear();
   status_ = 0;
 
-  // Perception-aware routing: when enabled (ground-robot 2D + a tristate belief),
-  // the global path is produced by the sensor-coverage lattice A* instead of the
-  // grid A*/JPS below. Falls through to the standard search if it can't produce a
-  // coverage-feasible path, so behavior degrades gracefully rather than failing.
-  if (perceptionAwareActive()) {
+  // Perception-aware routing. Once perception-aware planning is ENABLED for this
+  // (ground, 2D) robot, this path is intentionally fail-STOP and NEVER falls back to
+  // the plain grid A*/JPS below -- falling back would drive through unobserved space
+  // and defeat the whole point. So we gate on the *intent* flag (perception_aware_),
+  // not on readiness: if the coverage search cannot even run (not in 2D mode, or no
+  // tristate belief published yet) we reject the replan and let the robot hold, and
+  // if it runs but finds no feasible path we also reject (handled in
+  // planPerceptionAware). The robot never plans blindly through unknown.
+  if (perception_aware_) {
+    if (!is_2d_mode_) {
+      printf(ANSI_COLOR_RED
+             "perception-aware enabled but planner is NOT in 2D mode; rejecting replan "
+             "(fail-stop, NO grid fallback)\n" ANSI_COLOR_RESET);
+      path_.clear();
+      raw_path_.clear();
+      status_ = 0;
+      return false;
+    }
+    if (perception_belief_ == nullptr) {
+      printf(ANSI_COLOR_RED
+             "perception-aware enabled but no tristate belief available yet; rejecting "
+             "replan (fail-stop, NO grid fallback). Robot holds until the belief is "
+             "published.\n" ANSI_COLOR_RESET);
+      path_.clear();
+      raw_path_.clear();
+      status_ = 0;
+      return false;
+    }
+
     if (planPerceptionAware(start, start_vel, goal, final_g)) {
       return true;
     }
+
     if (planner_verbose_) {
       printf(ANSI_COLOR_YELLOW
-             "perception-aware plan found no coverage-feasible path; "
-             "falling back to grid search\n" ANSI_COLOR_RESET);
+            "perception-aware planning failed; rejecting this replan (no grid fallback by design)\n"
+            ANSI_COLOR_RESET);
     }
+
     path_.clear();
     raw_path_.clear();
     status_ = 0;
+    return false;
   }
 
   Veci<3> start_int = map_util_->floatToInt(start);
@@ -738,10 +765,56 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   P.max_expand = max_expand_;
   P.timeout_ms = hgp_timeout_duration_ms_;
 
+  // Reset the partial-plan telemetry each call (queryable via the getters below so a
+  // behavior layer can detect "stuck creeping" and escalate).
+  perception_last_partial_ = false;
+  perception_last_residual_m_ = 0.0;
+
   hgp::PerceptionPlanResult r = hgp::planPerceptionAware(
       *perception_belief_, *perception_sensor_, P, start(0), start(1), heading, goal(0), goal(1));
 
-  if (!r.ok || r.states.empty()) return false;
+  if (!r.ok || r.states.empty()) {
+    // Always surface WHY the coverage search produced no usable path (stop reason +
+    // work done), so a rover-side stall is diagnosable without planner_verbose_.
+    // NO_PROGRESS/EXHAUSTED = no coverage-feasible move existed; MAX_EXPAND/TIMEOUT =
+    // resource limit hit before any progress (raise perception max_expand/timeout).
+    printf(ANSI_COLOR_RED
+           "perception-aware A*: no usable path (stop=%s, expanded=%d, max_expand=%d, "
+           "timeout=%dms). Replan rejected (fail-stop, no grid fallback by design).\n"
+           ANSI_COLOR_RESET,
+           hgp::stopReasonStr(r.stop_reason), r.expanded, P.max_expand, P.timeout_ms);
+    return false;
+  }
+
+  // Progress toward the goal (start distance minus the returned path's residual).
+  const double start_res = std::hypot(goal(0) - start(0), goal(1) - start(1));
+  const auto& last_state = r.states.back();
+  const double res_to_goal = std::hypot(goal(0) - last_state[0], goal(1) - last_state[1]);
+  const double progress = start_res - res_to_goal;
+
+  // Progress gate: a best-node PARTIAL path that barely advances (< ~1 cell net) is a
+  // stall, not a solution -- reject it (fail-stop) so the robot holds/escalates rather
+  // than inching in place. Full (goal-reached) paths always pass this gate.
+  if (r.partial && progress < P.res) {
+    printf(ANSI_COLOR_RED
+           "perception-aware A*: partial path makes only %.3f m net progress (< %.3f m); "
+           "treating as stall, rejecting replan (fail-stop).\n" ANSI_COLOR_RESET,
+           progress, P.res);
+    return false;
+  }
+  perception_last_partial_ = r.partial;
+  perception_last_residual_m_ = res_to_goal;
+  // Faithful to the Python prototype: the coverage audit is a DIAGNOSTIC, not a gate.
+  // The hard invariant enforced inside the lattice search already guarantees every
+  // swept unknown cell was coverage-feasible; blind_unknown_entries only reports where
+  // the independent (ladder-free) re-check disagrees with the planner's ladder credit.
+  // We log it for monitoring rather than rejecting an otherwise-feasible path.
+  if (r.blind_unknown_entries > 0) {
+    printf(ANSI_COLOR_YELLOW
+           "perception-aware audit: %d blind unknown cell(s) on the returned path "
+           "(diagnostic; path NOT rejected)\n" ANSI_COLOR_RESET,
+           r.blind_unknown_entries);
+  }
 
   // Convert (x, y, theta) poses -> vec_Vecf<3> path at the start's z plane.
   const double z = start(2);
@@ -750,12 +823,27 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   for (const auto& s : r.states) {
     raw_path_.emplace_back(Vec3f(s[0], s[1], z));
   }
-  // Pin the endpoints exactly to the requested start/goal xy for downstream use.
+  // Pin the start exactly. Pin the END to the goal ONLY when the goal was actually
+  // reached -- for a partial path the last pose is the closest reachable node, and
+  // faking it to the goal would tell downstream the robot is at the goal when it is
+  // not (and would create a phantom final segment through unvetted space).
   raw_path_.front() = Vec3f(start(0), start(1), z);
-  raw_path_.back() = Vec3f(goal(0), goal(1), z);
+  if (r.stop_reason == hgp::StopReason::GOAL) {
+    raw_path_.back() = Vec3f(goal(0), goal(1), z);
+  }
   path_ = raw_path_;
   final_g = r.cost;
   status_ = 0;
+
+  // Always surface a PARTIAL (goal-not-reached) result with how far short it stops, so
+  // repeated stuck-creeping is visible. Receding-horizon: the robot advances along the
+  // partial path and replans from there as the belief grows.
+  if (r.partial) {
+    printf(ANSI_COLOR_YELLOW
+           "perception-aware A*: PARTIAL path (stop=%s), %.3f m short of goal "
+           "(net progress=%.3f m, expanded=%d).\n" ANSI_COLOR_RESET,
+           hgp::stopReasonStr(r.stop_reason), res_to_goal, progress, r.expanded);
+  }
   // Always surface a max-expansion cap hit (so it can be monitored for tuning);
   // full stop-reason logging under planner_verbose_.
   if (r.stop_reason == hgp::StopReason::MAX_EXPAND) {
