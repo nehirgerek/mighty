@@ -216,31 +216,52 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P) {
 // ===========================================================================
 // Visibility
 // ===========================================================================
-uint64_t Visibility::rayKey(int ix0, int iy0, int ix1, int iy1) {
-  return (static_cast<uint64_t>(static_cast<uint16_t>(ix0)) << 48) |
-         (static_cast<uint64_t>(static_cast<uint16_t>(iy0)) << 32) |
-         (static_cast<uint64_t>(static_cast<uint16_t>(ix1)) << 16) |
-         static_cast<uint64_t>(static_cast<uint16_t>(iy1));
-}
-
 bool Visibility::rayClear(int ix0, int iy0, int ix1, int iy1) {
-  const uint64_t key = rayKey(ix0, iy0, ix1, iy1);
+  const RayKey key{ix0, iy0, ix1, iy1};
   auto it = ray_cache_.find(key);
   if (it != ray_cache_.end()) return it->second != 0;
 
-  const double x0 = ix0 + 0.5, y0 = iy0 + 0.5;
-  const double x1 = ix1 + 0.5, y1 = iy1 + 0.5;
-  const double dist = std::hypot(x1 - x0, y1 - y0);
-  const int n = std::max(1, static_cast<int>(dist / 0.5));
+  // Amanatides & Woo grid DDA over the segment between cell centers: visits every
+  // cell the ray actually crosses (no gaps, unlike fractional sampling). Cell i
+  // spans [i, i+1) with center i+0.5. Both endpoints (observer cell and target
+  // cell) are excluded; UNK is transparent (optimism), OOB counts as occupied.
   bool ok = true;
-  for (int k = 1; k < n; ++k) {  // skip both endpoints
-    const double t = static_cast<double>(k) / n;
-    const int cx = static_cast<int>(x0 + (x1 - x0) * t);
-    const int cy = static_cast<int>(y0 + (y1 - y0) * t);
-    if (cx == ix1 && cy == iy1) continue;
-    if (m_.isOccupied(cx, cy)) {  // UNK is transparent (optimism); OOB is occupied
-      ok = false;
-      break;
+  if (!(ix0 == ix1 && iy0 == iy1)) {
+    const double x0 = ix0 + 0.5, y0 = iy0 + 0.5;
+    const double x1 = ix1 + 0.5, y1 = iy1 + 0.5;
+    const double dx = x1 - x0, dy = y1 - y0;
+
+    const int stepx = (dx > 0) - (dx < 0);
+    const int stepy = (dy > 0) - (dy < 0);
+    // t (in [0,1]) to reach the first cell boundary, and to advance one full cell.
+    double tMaxX = kInf, tDeltaX = kInf;
+    if (stepx != 0) {
+      const double bx = (stepx > 0) ? (ix0 + 1) : ix0;  // next x grid line
+      tMaxX = (bx - x0) / dx;
+      tDeltaX = std::abs(1.0 / dx);
+    }
+    double tMaxY = kInf, tDeltaY = kInf;
+    if (stepy != 0) {
+      const double by = (stepy > 0) ? (iy0 + 1) : iy0;
+      tMaxY = (by - y0) / dy;
+      tDeltaY = std::abs(1.0 / dy);
+    }
+
+    int cx = ix0, cy = iy0;
+    while (true) {
+      if (tMaxX < tMaxY) {
+        cx += stepx;
+        tMaxX += tDeltaX;
+      } else {
+        cy += stepy;
+        tMaxY += tDeltaY;
+      }
+      if (cx == ix1 && cy == iy1) break;         // reached target cell (endpoint)
+      if (tMaxX > 1.0 && tMaxY > 1.0) break;      // passed the segment end
+      if (m_.isOccupied(cx, cy)) {                // interior cell blocks the ray
+        ok = false;
+        break;
+      }
     }
   }
   ray_cache_.emplace(key, ok ? 1 : 0);

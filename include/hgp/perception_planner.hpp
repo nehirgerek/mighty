@@ -130,6 +130,28 @@ std::vector<std::vector<Primitive>> buildPrimitives(const PerceptionParams& P);
 // Visibility (predicted observation) with memoized ray casting
 // ---------------------------------------------------------------------------
 
+/** @brief Full-width (four 32-bit ints) ray-cache key -- no bit-packing, so
+ *  negative/out-of-bounds coordinates and indices > 65535 can never alias. */
+struct RayKey {
+  int ix0, iy0, ix1, iy1;
+  bool operator==(const RayKey& o) const {
+    return ix0 == o.ix0 && iy0 == o.iy0 && ix1 == o.ix1 && iy1 == o.iy1;
+  }
+};
+struct RayKeyHash {
+  std::size_t operator()(const RayKey& k) const {
+    std::size_t h = 1469598103934665603ull;  // FNV-1a
+    auto mix = [&h](int v) {
+      h = (h ^ static_cast<std::size_t>(static_cast<uint32_t>(v))) * 1099511628211ull;
+    };
+    mix(k.ix0);
+    mix(k.iy0);
+    mix(k.ix1);
+    mix(k.iy1);
+    return h;
+  }
+};
+
 class Visibility {
  public:
   Visibility(const OccGrid2D& belief, const SensorModel& sensor)
@@ -139,10 +161,9 @@ class Visibility {
 
  private:
   bool rayClear(int ix0, int iy0, int ix1, int iy1);
-  static uint64_t rayKey(int ix0, int iy0, int ix1, int iy1);
   const OccGrid2D& m_;
   const SensorModel& s_;
-  std::unordered_map<uint64_t, char> ray_cache_;  // 0/1 = clear cached false/true
+  std::unordered_map<RayKey, char, RayKeyHash> ray_cache_;  // 0/1 = clear cached false/true
 };
 
 // ---------------------------------------------------------------------------
