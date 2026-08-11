@@ -201,4 +201,21 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
                                          double start_theta, double goal_x, double goal_y,
                                          const SensorModel* audit_sensor = nullptr);
 
+/** @brief Audit an already-executed (dense) xy trajectory against the coverage
+ *  invariant -- for cases where a DOWNSTREAM stage (e.g. an L-BFGS local optimizer)
+ *  reshaped the certified lattice path without knowledge of the sensor model.
+ *
+ *  Walks the polyline, takes each vertex heading as atan2(next - cur) (the MPC yaw
+ *  convention), and for every UNKNOWN cell swept along the centerline requires it to
+ *  be predicted-visible (sensor FOV + occlusion) from some pose at or before the
+ *  segment on which it is entered -- i.e. the rover must have observed the cell before
+ *  driving over it. The back-projection ladder is applied behind the segment-start
+ *  pose, mirroring the planner. Returns the number of blind (uncovered) cells and, if
+ *  @p blind_cells is non-null, their world coordinates. Returns 0 immediately when
+ *  P.use_coverage_rule is false (no invariant to audit). */
+int auditTrajectoryCoverage(const OccGrid2D& belief, const SensorModel& sensor,
+                            const PerceptionParams& P,
+                            const std::vector<std::array<double, 2>>& xy,
+                            std::vector<std::array<double, 2>>* blind_cells = nullptr);
+
 }  // namespace hgp

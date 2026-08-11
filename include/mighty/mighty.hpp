@@ -452,6 +452,17 @@ class MIGHTY {
    */
   std::shared_ptr<mighty::VoxelMapUtil> getMapUtil() const { return hgp_manager_.map_util_; }
 
+  /** @brief True when the executed-trajectory perception coverage audit can run
+   *  (perception-aware planning active with a belief + sensor). */
+  bool perceptionAuditActive() const { return hgp_manager_.perceptionAuditActive(); }
+
+  /** @brief Audit an executed xy path (e.g. the post-L-BFGS MPC path) against the
+   *  perception coverage invariant. @return number of blind (unobserved) cells it
+   *  would traverse; 0 means safe (or the audit is inactive). */
+  int auditPerceptionCoverage(const std::vector<std::array<double, 2>>& xy) const {
+    return hgp_manager_.auditPerceptionCoverage(xy);
+  }
+
  private:
   // Parameters
   parameters par_;          // Parameters of the planner

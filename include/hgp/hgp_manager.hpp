@@ -380,6 +380,17 @@ class HGPManager {
     if (planner_ptr_) planner_ptr_->setMaxDistVertexes2D(d);
   }
 
+  /** @brief True when the executed-trajectory perception coverage audit can run. */
+  bool perceptionAuditActive() const {
+    return planner_ptr_ && planner_ptr_->perceptionAuditActive();
+  }
+
+  /** @brief Audit an executed xy path against the coverage invariant.
+   *  @return number of blind (unobserved) cells it would traverse (0 = safe/inactive). */
+  int auditPerceptionCoverage(const std::vector<std::array<double, 2>>& xy) const {
+    return planner_ptr_ ? planner_ptr_->auditPerceptionCoverage(xy) : 0;
+  }
+
   /** @brief Set ESDF grid for distance-based A* cost (ground robot only). */
   void setEsdfGrid(std::shared_ptr<const EsdfGrid2D> grid, double weight, double d_safe) {
     esdf_grid_ = grid;

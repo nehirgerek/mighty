@@ -2801,6 +2801,28 @@ void MIGHTY_NODE::publishMpcPath() {
   // Assign per-waypoint speeds
   path_msg.speeds = speeds;
 
+  // BLOCKER 3 -- perception audit of the ACTUAL executed path. The lattice planner
+  // certifies its own path, but L-BFGS reshapes it downstream with no knowledge of the
+  // Mid-360 coverage invariant, so a certified global path does NOT imply a certified
+  // MPC path. Re-audit the published poses (same atan2(next-cur) yaw convention used
+  // above) and refuse to publish if the trajectory would drive through unobserved
+  // space -- fail-stop, consistent with the global planner. A stronger future fix is
+  // to put the perception term inside the local optimizer itself.
+  if (mighty_ptr_->perceptionAuditActive()) {
+    std::vector<std::array<double, 2>> xy;
+    xy.reserve(path_msg.poses.size());
+    for (const auto& p : path_msg.poses)
+      xy.push_back({p.pose.position.x, p.pose.position.y});
+    const int blind = mighty_ptr_->auditPerceptionCoverage(xy);
+    if (blind > 0) {
+      RCLCPP_WARN(this->get_logger(),
+                  "MPC path perception audit: %d blind unknown cell(s) after L-BFGS; "
+                  "NOT publishing this MPC path (perception fail-stop).",
+                  blind);
+      return;
+    }
+  }
+
   pub_mpc_path_->publish(path_msg);
 }
 

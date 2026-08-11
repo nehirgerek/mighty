@@ -589,4 +589,79 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   return res;
 }
 
+// ===========================================================================
+// Executed-trajectory coverage audit (post-optimizer)
+// ===========================================================================
+int auditTrajectoryCoverage(const OccGrid2D& belief, const SensorModel& sensor,
+                            const PerceptionParams& P,
+                            const std::vector<std::array<double, 2>>& xy,
+                            std::vector<std::array<double, 2>>* blind_cells) {
+  if (!P.use_coverage_rule) return 0;  // no invariant to audit
+  const int n = static_cast<int>(xy.size());
+  if (n < 2) return 0;
+
+  // Per-vertex heading (MPC convention): atan2 of the forward difference; the last
+  // vertex reuses the previous heading.
+  std::vector<double> yaw(n);
+  for (int i = 0; i + 1 < n; ++i)
+    yaw[i] = std::atan2(xy[i + 1][1] - xy[i][1], xy[i + 1][0] - xy[i][0]);
+  yaw[n - 1] = (n >= 2) ? yaw[n - 2] : 0.0;
+
+  Visibility vis(belief, sensor);
+  const double step = std::max(1e-3, P.res * 0.4);  // sub-cell sampling along segments
+
+  int blind = 0;
+  std::unordered_map<uint64_t, char> counted;  // avoid recounting a blind cell
+  auto cellKey = [](int cx, int cy) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32) |
+           static_cast<uint32_t>(cy);
+  };
+
+  for (int i = 0; i + 1 < n; ++i) {
+    const double x0 = xy[i][0], y0 = xy[i][1];
+    const double x1 = xy[i + 1][0], y1 = xy[i + 1][1];
+    const double seg = std::hypot(x1 - x0, y1 - y0);
+    const int ns = std::max(1, static_cast<int>(std::ceil(seg / step)));
+    bool have_last = false;
+    int last_cx = 0, last_cy = 0;
+    for (int k = 0; k <= ns; ++k) {
+      const double u = static_cast<double>(k) / ns;
+      const double x = x0 + u * (x1 - x0), y = y0 + u * (y1 - y0);
+      int cx, cy;
+      belief.worldToGrid(x, y, cx, cy);
+      if (have_last && cx == last_cx && cy == last_cy) continue;
+      have_last = true;
+      last_cx = cx;
+      last_cy = cy;
+      if (!belief.isUnknown(cx, cy)) continue;
+      const uint64_t key = cellKey(cx, cy);
+      if (counted.find(key) != counted.end()) continue;  // already flagged
+
+      // Covered iff predicted-visible from some pose at or before entering this
+      // segment (the rover must have observed the cell before driving over it).
+      bool ok = false;
+      for (int j = 0; j <= i && !ok; ++j)
+        if (vis.visible(xy[j][0], xy[j][1], yaw[j], cx, cy)) ok = true;
+      // Back-projection ladder behind the segment-start pose (same device the planner
+      // uses to credit the blind annulus from a straight approach).
+      for (int m = 1; m <= P.back_projection_steps && !ok; ++m) {
+        const double dlt = P.back_projection_step * m;
+        const double bx = x0 - dlt * std::cos(yaw[i]);
+        const double by = y0 - dlt * std::sin(yaw[i]);
+        if (vis.visible(bx, by, yaw[i], cx, cy)) ok = true;
+      }
+      if (!ok) {
+        ++blind;
+        counted.emplace(key, 1);
+        if (blind_cells) {
+          double wx, wy;
+          belief.gridToWorld(cx, cy, wx, wy);
+          blind_cells->push_back({wx, wy});
+        }
+      }
+    }
+  }
+  return blind;
+}
+
 }  // namespace hgp

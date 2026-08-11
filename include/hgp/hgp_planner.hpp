@@ -287,6 +287,23 @@ class HGPPlanner {
     return perception_aware_ && is_2d_mode_ && perception_belief_ != nullptr;
   }
 
+  /** @brief True when the executed-trajectory coverage audit can run (perception-aware
+   *  enabled for a ground/2D robot with a belief + sensor available). */
+  bool perceptionAuditActive() const {
+    return perception_aware_ && is_2d_mode_ && perception_belief_ != nullptr &&
+           perception_sensor_ != nullptr;
+  }
+
+  /** @brief Audit an executed xy path (e.g. the post-L-BFGS MPC path) against the
+   *  coverage invariant. @return number of blind (unobserved) cells it would traverse;
+   *  0 means safe (or the audit is inactive). See hgp::auditTrajectoryCoverage. */
+  int auditPerceptionCoverage(const std::vector<std::array<double, 2>>& xy) const {
+    if (!perception_belief_ || !perception_sensor_) return 0;
+    hgp::PerceptionParams P = perception_params_;
+    P.res = perception_belief_->resolution();
+    return hgp::auditTrajectoryCoverage(*perception_belief_, *perception_sensor_, P, xy);
+  }
+
   bool perception_aware_{false};
   std::shared_ptr<const OccGrid2D> perception_belief_;
   std::shared_ptr<hgp::SensorModel> perception_sensor_;
