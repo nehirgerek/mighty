@@ -299,6 +299,10 @@ bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const
       const double bx = par_.drone_bbox[0], by = par_.drone_bbox[1];
       pparams.robot_radius = 0.5 * (bx > by ? bx : by);
     }
+    // Goal tolerance for the lattice, clamped to <= goal_radius so a certified lattice
+    // GOAL state always lies inside MIGHTY's accepted goal region (||pos - G|| <
+    // goal_radius). Exposed as perception_goal_tol; goal_radius itself is untouched.
+    pparams.goal_tol = std::min(par_.perception_goal_tol, par_.goal_radius);
     planner_ptr_->configurePerceptionAware(pa_enable, occ_grid_2d_, pparams);
   }
 

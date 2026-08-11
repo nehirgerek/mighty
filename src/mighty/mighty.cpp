@@ -1075,7 +1075,17 @@ bool MIGHTY::generateLocalTrajectory(const state& local_A, double A_time, vec_Ve
   state local_E;
   Vec3f mean_point;
 
-  if (drone_status_ == DroneStatus::GOAL_REACHED || drone_status_ == DroneStatus::GOAL_SEEN) {
+  // For PERCEPTION-AWARE GROUND planning, the L-BFGS terminal must never go beyond the
+  // collision/coverage-certified HGP endpoint. Within goal_seen_radius the status flips
+  // to GOAL_SEEN, and snapping local_E to the exact goal (local_G) would let L-BFGS
+  // optimize a terminal segment past the certified lattice endpoint (which may stop up
+  // to perception goal_tol short of G) into unvetted space. So in that mode we always
+  // target the certified path end. Normal MIGHTY ground (perception off) and UAV keep
+  // the exact-goal terminal snap unchanged.
+  const bool perception_ground =
+      par_.perception_aware_planning && par_.vehicle_type != "uav" && par_.use_2d_planning;
+  if (!perception_ground &&
+      (drone_status_ == DroneStatus::GOAL_REACHED || drone_status_ == DroneStatus::GOAL_SEEN)) {
     local_E = local_G;
   } else {
     local_E.pos = global_path.back();

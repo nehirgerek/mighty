@@ -272,6 +272,10 @@ struct parameters {
   // the path only enters unknown space it could actually have observed. The
   // lattice/sensor constants use the tuned defaults in PerceptionParams/Mid360FOV.
   bool perception_aware_planning{false};
+  // Perception lattice goal tolerance [m]. A lattice state within this distance of the
+  // goal is accepted as GOAL. Kept <= goal_radius (clamped in HGPManager::solveHGP) so a
+  // certified lattice GOAL state lies inside MIGHTY's accepted goal region.
+  double perception_goal_tol{0.45};
   double robot_height{0.5};            // [m] Robot height for obstacle column detection
   double obstacle_min_height{0.3};     // [m] Min height span in column to classify as obstacle
   bool use_column_any_occupied{true};  // [-] Any occupied voxel in column → 2D occupied
