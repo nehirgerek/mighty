@@ -154,7 +154,7 @@ class HGPManager {
    */
   bool solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const Vec3f& goal_sent,
                 double& final_g, double weight, double current_time, vec_Vecf<3>& path,
-                vec_Vecf<3>& raw_path);
+                vec_Vecf<3>& raw_path, double start_yaw = NAN);
 
   /** @brief Truncate a path to include only waypoints in free space.
    *  @param path Input path to check.

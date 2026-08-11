@@ -907,7 +907,7 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
   vec_Vecf<3> raw_global_path;
   if (!hgp_manager_.solveHGP(local_A.pos, start_dir_hint, local_G.pos, final_g_,
                              par_.global_planner_heuristic_weight, A_time, global_path,
-                             raw_global_path)) {
+                             raw_global_path, local_A.yaw)) {
     if (par_.debug_verbose)
       printf("[TIMING]   HGP solve (FAILED): %.2f ms\n", timer_solve.getElapsedMicros() / 1000.0);
     hgp_failure_count_++;

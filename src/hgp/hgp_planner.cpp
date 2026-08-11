@@ -329,7 +329,7 @@ vec_Vecf<3> HGPPlanner::getAllSet() const {
 }
 
 bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf<3>& goal,
-                      double& final_g, double current_time, decimal_t eps) {
+                      double& final_g, double current_time, decimal_t eps, double start_yaw) {
   if (map_util_->map_.size() == 0) {
     std::cout << "map size: " << map_util_->map_.size() << std::endl;
     printf(ANSI_COLOR_RED "need to set the map!\n" ANSI_COLOR_RESET);
@@ -375,7 +375,7 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
       return false;
     }
 
-    if (planPerceptionAware(start, start_vel, goal, final_g)) {
+    if (planPerceptionAware(start, start_vel, goal, final_g, start_yaw)) {
       return true;
     }
 
@@ -746,16 +746,25 @@ double HGPPlanner::getRecoverPathTime() { return hgp_recover_path_time_; }
 // smoothing pipeline: the coverage-feasible lattice path is used directly.
 // ---------------------------------------------------------------------------
 bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_vel,
-                                     const Vecf<3>& goal, double& final_g) {
+                                     const Vecf<3>& goal, double& final_g, double start_yaw) {
   if (!perception_belief_ || !perception_sensor_) return false;
 
-  // Start heading: prefer the velocity direction; else aim from start toward goal.
+  // Sensor orientation = the rover's ACTUAL yaw. This is load-bearing: the Mid-360
+  // trusted wedge is only ~30 deg wide, so orientation inferred from the previous-path
+  // direction hint (start_vel) can be off by more than the entire FOV, pointing the
+  // coverage test at the wrong region entirely. Use the real yaw when supplied; only
+  // fall back to the velocity/goal direction if no yaw was passed (e.g. non-ground
+  // callers that don't thread it through).
   double heading;
-  const double vx = start_vel(0), vy = start_vel(1);
-  if (std::hypot(vx, vy) > 1e-6) {
-    heading = std::atan2(vy, vx);
+  if (std::isfinite(start_yaw)) {
+    heading = start_yaw;
   } else {
-    heading = std::atan2(goal(1) - start(1), goal(0) - start(0));
+    const double vx = start_vel(0), vy = start_vel(1);
+    if (std::hypot(vx, vy) > 1e-6) {
+      heading = std::atan2(vy, vx);
+    } else {
+      heading = std::atan2(goal(1) - start(1), goal(0) - start(0));
+    }
   }
 
   // Keep the lattice resolution aligned with the belief grid so cell math matches,

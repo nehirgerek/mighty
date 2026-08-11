@@ -101,8 +101,10 @@ class HGPPlanner {
    *  @param eps Heuristic weight for A* search.
    *  @return True if a valid path was found.
    */
+  /** @param start_yaw Rover's actual yaw [rad] for the perception-aware sensor model.
+   *  Pass NAN (default) to fall back to the velocity/goal heading (non-ground callers). */
   bool plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf<3>& goal, double& final_g,
-            double current_time, decimal_t eps = 1);
+            double current_time, decimal_t eps = 1, double start_yaw = NAN);
 
   /** @brief Get the nodes in the open set after planning.
    *  @return Positions of open-set nodes.
@@ -304,9 +306,11 @@ class HGPPlanner {
   double perceptionLastResidualToGoal() const { return perception_last_residual_m_; }
 
   /** @brief Run the perception-aware lattice A* and fill path_/raw_path_.
+   *  @param start_yaw Rover's actual yaw [rad] used as the sensor orientation; NAN
+   *         falls back to the velocity/goal heading.
    *  @return true on success (a coverage-feasible path to the goal was found). */
   bool planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf<3>& goal,
-                           double& final_g);
+                           double& final_g, double start_yaw = NAN);
 
   /** @brief Configure corridor-center corner snap post-processing (ground robot only).
    *

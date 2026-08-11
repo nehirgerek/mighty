@@ -258,7 +258,7 @@ inline void collapseIntoLongSegments(const mighty::VoxelMapUtil& map, double res
 
 bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const Vec3f& goal_sent,
                           double& final_g, double weight, double current_time, vec_Vecf<3>& path,
-                          vec_Vecf<3>& raw_path) {
+                          vec_Vecf<3>& raw_path, double start_yaw) {
   // map_util_for_planning_ was already copied in setupHGPPlanner() and modified by
   // freeStart/freeGoal — do NOT re-copy here or those freeings are lost.
 
@@ -305,8 +305,10 @@ bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const
   // HGP Plan
   bool result = false;
 
-  // Attempt to plan
-  result = planner_ptr_->plan(start, start_vel, goal, final_g, current_time, weight);
+  // Attempt to plan. start_yaw is the rover's ACTUAL yaw, threaded through for the
+  // perception-aware sensor model (its ~30 deg trusted wedge makes orientation error
+  // catastrophic); ignored by the plain grid A*.
+  result = planner_ptr_->plan(start, start_vel, goal, final_g, current_time, weight, start_yaw);
 
   // If there is a solution
   if (result) {
