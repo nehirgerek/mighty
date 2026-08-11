@@ -857,21 +857,36 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
            r.blind_unknown_entries);
   }
 
-  // Convert (x, y, theta) poses -> vec_Vecf<3> path at the start's z plane.
+  // Convert (x, y, theta) lattice poses -> vec_Vecf<3> path at the start's z plane.
+  //
+  // Issue 3 (in-place TURN primitives): the lattice encodes rotation as consecutive
+  // states at the SAME (x,y) with only theta changing. MIGHTY's waypoint path carries
+  // no yaw, and downstream (SolverLBFGS::prepareSolverForReplan -> t = dist / V_max)
+  // would compute dist==0 -> t==0 for such a segment. So COLLAPSE consecutive duplicate
+  // positions here: pure rotations drop out of the geometric path (their heading was
+  // only needed inside the lattice for the FoV coverage rule), leaving strictly
+  // forward-progress segments of non-zero length. No zero-length segment ever reaches
+  // the solver.
   const double z = start(2);
   raw_path_.clear();
   raw_path_.reserve(r.states.size());
   for (const auto& s : r.states) {
-    raw_path_.emplace_back(Vec3f(s[0], s[1], z));
+    const Vec3f wp(s[0], s[1], z);
+    if (raw_path_.empty()) {
+      raw_path_.emplace_back(wp);
+    } else {
+      const auto& p = raw_path_.back();
+      const double dx = wp(0) - p(0), dy = wp(1) - p(1);
+      if (dx * dx + dy * dy > 1e-12) raw_path_.emplace_back(wp);  // > ~1 micron
+    }
   }
-  // Pin the start exactly. Pin the END to the goal ONLY when the goal was actually
-  // reached -- for a partial path the last pose is the closest reachable node, and
-  // faking it to the goal would tell downstream the robot is at the goal when it is
-  // not (and would create a phantom final segment through unvetted space).
-  raw_path_.front() = Vec3f(start(0), start(1), z);
-  if (r.stop_reason == hgp::StopReason::GOAL) {
-    raw_path_.back() = Vec3f(goal(0), goal(1), z);
-  }
+  // Pin the start exactly to the robot's real position. Issue 4: do NOT pin the END to
+  // the goal. The lattice declares success within goal_tol (0.55 m), so the certified
+  // endpoint may be up to goal_tol from G, and that final endpoint->G connection was
+  // never checked by the collision/coverage rules. Leave the certified lattice endpoint
+  // as-is and let MIGHTY drive to it and replan, rather than fabricating an unvetted
+  // final segment to G.
+  if (!raw_path_.empty()) raw_path_.front() = Vec3f(start(0), start(1), z);
   path_ = raw_path_;
   final_g = r.cost;
   status_ = 0;
