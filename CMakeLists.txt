@@ -187,6 +187,12 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_occ_grid_2d_unknown
     rclcpp Eigen3 nav_msgs)
 
+  ament_add_gtest(test_perception_cost
+    src/test/test_perception_cost.cpp
+    src/hgp/perception_planner.cpp)
+  ament_target_dependencies(test_perception_cost
+    rclcpp Eigen3 nav_msgs)
+
   ament_add_gtest(test_frontier_detector
     src/test/test_frontier_detector.cpp
     src/mighty/frontier_detector.cpp)

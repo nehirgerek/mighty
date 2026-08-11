@@ -27,6 +27,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -175,6 +176,27 @@ class Visibility {
 enum class StopReason { GOAL, MAX_EXPAND, TIMEOUT, EXHAUSTED, NO_PROGRESS };
 const char* stopReasonStr(StopReason r);
 
+// ---------------------------------------------------------------------------
+// External (MIGHTY) cost hook
+// ---------------------------------------------------------------------------
+
+/** @brief Optional bridge that lets the perception lattice reuse MIGHTY's astar_heat
+ *  cost semantics WITHOUT this file depending on map_util / ROS. Both callbacks take
+ *  WORLD coordinates (metres); the integrator (HGPPlanner) converts to whatever grid
+ *  its cost source uses. All callbacks may be empty (=> that term contributes nothing).
+ *
+ *  Units: `cellPenalty` returns MIGHTY's per-cell soft cost (e.g. heat_weight * heat)
+ *  UNSCALED; the planner multiplies it by `res` so it integrates over spatial distance
+ *  consistently with the metre-based motion cost (see planPerceptionAware). */
+struct PerceptionCost {
+  /// HARD impassability beyond the planner's own occupancy inflation (e.g. MIGHTY's
+  /// static heat cutoff). If it returns true for any required swept cell, the edge is
+  /// rejected -- never turned into a finite penalty.
+  std::function<bool(double wx, double wy)> hardBlocked;
+  /// SOFT per-cell traversal penalty at (wx,wy), in MIGHTY per-cell units, pre-`res`.
+  std::function<double(double wx, double wy)> cellPenalty;
+};
+
 struct PerceptionPlanResult {
   bool ok = false;
   bool partial = false;   ///< true if `states` is a best-node partial path (goal not reached)
@@ -185,6 +207,10 @@ struct PerceptionPlanResult {
   int blind_unknown_entries = 0;              ///< unknown centerline cells the coverage audit
                                               ///< could not credit (ladder-based; diagnostic only)
   std::vector<std::array<double, 2>> blind_cells;  ///< their world coords (audit)
+  // Cost decomposition of the returned path (debugging / logging).
+  double motion_cost = 0.0;    ///< sum of primitive geometric costs (m + turn tie-break)
+  double heat_cost = 0.0;      ///< sum of res-scaled cellPenalty over swept cells
+  double unknown_cost = 0.0;   ///< sum of P.w_unknown * unk_cells * res
 };
 
 /** @brief Perception-aware lattice A*.
@@ -195,11 +221,14 @@ struct PerceptionPlanResult {
  *  @param start_x/y/theta  start pose (world metres / rad).
  *  @param goal_x/y      goal position (world metres).
  *  @param audit_sensor  optional sensor used only to audit realised coverage of
- *                       the returned path (defaults to `sensor`). */
+ *                       the returned path (defaults to `sensor`).
+ *  @param cost          optional MIGHTY cost hook (heat cutoff + soft heat). When null,
+ *                       the search uses only motion + unknown cost (standalone default). */
 PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorModel& sensor,
                                          const PerceptionParams& P, double start_x, double start_y,
                                          double start_theta, double goal_x, double goal_y,
-                                         const SensorModel* audit_sensor = nullptr);
+                                         const SensorModel* audit_sensor = nullptr,
+                                         const PerceptionCost* cost = nullptr);
 
 /** @brief Audit an already-executed (dense) xy trajectory against the coverage
  *  invariant -- for cases where a DOWNSTREAM stage (e.g. an L-BFGS local optimizer)

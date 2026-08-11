@@ -774,6 +774,36 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   P.res = perception_belief_->resolution();
   P.max_expand = max_expand_;
   P.timeout_ms = hgp_timeout_duration_ms_;
+  // Use MIGHTY's configured unknown weight, not the standalone lattice default, so the
+  // unknown term matches plain astar_heat's w_unknown_ (see graph_search.cpp getSucc).
+  P.w_unknown = w_unknown_;
+
+  // MIGHTY astar_heat cost bridge: reuse the SAME runtime heat map / weights / cutoff
+  // that the plain grid A* reads through map_util_, without coupling the standalone
+  // perception planner to map_util. Both callbacks take WORLD coords and convert to
+  // map_util's grid. Occupancy is NOT bridged here -- it stays a hard block via the
+  // lattice's robot_radius inflation (stricter than astar_heat's soft-obstacle mode).
+  // ESDF is intentionally NOT added: clearance is already encoded in heat_2d (matching
+  // the disabled direct-ESDF block in getSucc), so bridging heat avoids double-counting.
+  hgp::PerceptionCost cost;
+  if (map_util_) {
+    auto mu = map_util_;  // shared_ptr copy: keep the map alive for the callbacks' lifetime
+    // HARD: MIGHTY's static heat cutoff (same predicate as getSucc's hard cutoff).
+    cost.hardBlocked = [mu](double wx, double wy) -> bool {
+      if (!(mu->staticHeatEnabled() && mu->heat_cutoff_ratio_ > 0.0f)) return false;
+      const Veci<3> pi = mu->floatToInt(Vecf<3>(wx, wy, 0.0));
+      const float h = mu->getHeat2D(pi(0), pi(1));
+      return h > mu->heat_cutoff_ratio_ * mu->static_heat_Hmax_;
+    };
+    // SOFT (per cell, pre-res): w_heat * heat_2d, same term getSucc adds per grid step.
+    cost.cellPenalty = [mu](double wx, double wy) -> double {
+      if (!(mu->dynamicHeatEnabled() || mu->staticHeatEnabled())) return 0.0;
+      const float w_heat = mu->getHeatWeight();
+      if (w_heat <= 0.0f) return 0.0;
+      const Veci<3> pi = mu->floatToInt(Vecf<3>(wx, wy, 0.0));
+      return static_cast<double>(w_heat * mu->getHeat2D(pi(0), pi(1)));
+    };
+  }
 
   // Reset the partial-plan telemetry each call (queryable via the getters below so a
   // behavior layer can detect "stuck creeping" and escalate).
@@ -781,7 +811,8 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
   perception_last_residual_m_ = 0.0;
 
   hgp::PerceptionPlanResult r = hgp::planPerceptionAware(
-      *perception_belief_, *perception_sensor_, P, start(0), start(1), heading, goal(0), goal(1));
+      *perception_belief_, *perception_sensor_, P, start(0), start(1), heading, goal(0), goal(1),
+      /*audit_sensor=*/nullptr, &cost);
 
   if (!r.ok || r.states.empty()) {
     // Always surface WHY the coverage search produced no usable path (stop reason +
@@ -865,6 +896,12 @@ bool HGPPlanner::planPerceptionAware(const Vecf<3>& start, const Vecf<3>& start_
     printf("perception-aware A*: stop=%s states=%zu cost=%.3f expanded=%d blind_unknown=%d partial=%d\n",
            hgp::stopReasonStr(r.stop_reason), r.states.size(), r.cost, r.expanded,
            r.blind_unknown_entries, (int)r.partial);
+  }
+  // Cost decomposition of the returned path (once per plan, not per node) for tuning
+  // the heat/unknown weights against plain astar_heat.
+  if (planner_verbose_) {
+    printf("perception-aware A*: cost breakdown  motion=%.3f  heat=%.3f  unknown=%.3f  total_g=%.3f\n",
+           r.motion_cost, r.heat_cost, r.unknown_cost, r.cost);
   }
   return true;
 }

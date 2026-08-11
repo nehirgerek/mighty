@@ -314,7 +314,8 @@ struct OpenNode {
 PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorModel& sensor,
                                          const PerceptionParams& P, double start_x, double start_y,
                                          double start_theta, double goal_x, double goal_y,
-                                         const SensorModel* audit_sensor) {
+                                         const SensorModel* audit_sensor,
+                                         const PerceptionCost* cost) {
   PerceptionPlanResult res;
   const int NH = P.n_headings;
   const double dth_rad = 2.0 * kPi / NH;
@@ -460,11 +461,25 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
       // cell must be predicted-observable before traversal.
       bool feasible = true;
       int unk_cells = 0;
+      double heat_accum = 0.0;  // Σ MIGHTY per-cell soft cost (cellPenalty), pre-`res`
       for (const auto& off : pr.sweep) {
         const int cix = ix + off[0], ciy = iy + off[1];
         if (isBlocked(cix, ciy)) {
           feasible = false;
           break;
+        }
+        // MIGHTY astar_heat integration over the swept centerline. Occupancy stays a
+        // HARD block via the robot_radius inflation above; here we add MIGHTY's other
+        // HARD gate (the static heat cutoff) and accumulate its SOFT per-cell cost.
+        // `pr.sweep` is de-duplicated in buildPrimitives, so no cell is charged twice.
+        if (cost) {
+          double wcx, wcy;
+          belief.gridToWorld(cix, ciy, wcx, wcy);
+          if (cost->hardBlocked && cost->hardBlocked(wcx, wcy)) {  // heat cutoff -> impassable
+            feasible = false;
+            break;
+          }
+          if (cost->cellPenalty) heat_accum += cost->cellPenalty(wcx, wcy);
         }
         if (!belief.isUnknown(cix, ciy)) continue;
         ++unk_cells;
@@ -501,7 +516,11 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
       const int nix = ix + pr.end_dx, niy = iy + pr.end_dy;
       if (!inBounds(nix, niy)) continue;
       const int64_t nst = keyOf(nix, niy, nih, mv_after);
-      const double ng = gc + pr.cost + P.w_unknown * unk_cells * P.res;
+      // Edge cost (all terms in metres): motion (arc length + turn tie-break) + unknown
+      // + heat. Per-cell MIGHTY terms are multiplied by res (metres/cell) so a straight
+      // over N cells accumulates res x the grid-astar_heat per-cell sum -- same relative
+      // route preference, in the metre units the Euclidean heuristic uses.
+      const double ng = gc + pr.cost + P.w_unknown * unk_cells * P.res + heat_accum * P.res;
       auto it = g.find(nst);
       if (it == g.end() || ng < it->second - 1e-9) {
         g[nst] = ng;
@@ -545,6 +564,28 @@ PerceptionPlanResult planPerceptionAware(const OccGrid2D& belief, const SensorMo
   res.cost = g[terminal];
   res.ok = true;
   res.partial = partial;
+
+  // --- cost decomposition of the returned path (debug / logging) --------------
+  // Re-derive the three components along the final chain (same terms/scaling as the
+  // edge cost above). Sums to res.cost up to the per-turn 5e-4 tie-break epsilons.
+  for (size_t i = 1; i < chain.size(); ++i) {
+    const Came& cm = came[chain[i]];
+    if (cm.prim == nullptr) continue;
+    res.motion_cost += cm.prim->cost;
+    if (cm.prim->kind == Primitive::TURN) continue;
+    const auto sprev = unpack[chain[i - 1]];
+    int unk = 0;
+    for (const auto& off : cm.prim->sweep) {
+      const int cix = sprev[0] + off[0], ciy = sprev[1] + off[1];
+      if (cost && cost->cellPenalty) {
+        double wcx, wcy;
+        belief.gridToWorld(cix, ciy, wcx, wcy);
+        res.heat_cost += cost->cellPenalty(wcx, wcy) * P.res;
+      }
+      if (belief.isUnknown(cix, ciy)) ++unk;
+    }
+    res.unknown_cost += P.w_unknown * unk * P.res;
+  }
 
   // --- coverage audit (faithful to the Python prototype) ----------------------
   // Diagnostic re-check of the returned path: walk each forward/arc primitive and,
