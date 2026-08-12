@@ -197,6 +197,9 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_frontier_viewpoint
     Eigen3)
 
+  ament_add_gtest(test_goal_radius_override
+    src/test/test_goal_radius_override.cpp)
+
   ament_add_gtest(test_frontier_manager
     src/test/test_frontier_manager.cpp
     src/mighty/frontier_detector.cpp

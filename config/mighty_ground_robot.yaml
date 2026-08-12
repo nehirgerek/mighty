@@ -395,7 +395,7 @@ mighty_node:
         exploration.viewpoint.observation_dwell_sec: 0.5         # [s] dwell at the viewpoint before marking observed
         exploration.viewpoint.fallback_to_legacy_centroid: false # [-] on selector failure: false = skip/invalidate frontier; true = old centroid goal
         exploration.viewpoint.pre_offset_m: 0.50                 # [m] l: pre-viewpoint standoff so the final leg q_pre->q* faces the target (approach heading)
-        exploration.viewpoint.arrival_tol_m: 0.22                # [m] dedicated viewpoint arrival tolerance (tighter than goal_radius)
+        exploration.viewpoint.arrival_tol_m: 0.25                # [m] viewpoint arrival tolerance; scoped MIGHTY goal_radius override drives to this for q_pre and q*
         exploration.viewpoint.min_reveal_fraction: 0.30          # [-] R = 1 - N_unknown_after/N_unknown_before; R>=this => viewpoint succeeded (does NOT itself mark VISITED)
         exploration.viewpoint.strip_half_width_m: 0.75           # [m] lateral (tangent) half-extent of the PCA-aligned reveal strip behind the frontier
         exploration.viewpoint.strip_depth_m: 0.0                 # [m] along-normal strip depth; 0 => use max(target_depths_m)

@@ -796,7 +796,7 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("exploration.viewpoint.observation_dwell_sec", 0.5);
   this->declare_parameter("exploration.viewpoint.fallback_to_legacy_centroid", false);
   this->declare_parameter("exploration.viewpoint.pre_offset_m", 0.50);
-  this->declare_parameter("exploration.viewpoint.arrival_tol_m", 0.22);
+  this->declare_parameter("exploration.viewpoint.arrival_tol_m", 0.25);
   this->declare_parameter("exploration.viewpoint.min_reveal_fraction", 0.30);
   this->declare_parameter("exploration.viewpoint.strip_half_width_m", 0.75);
   this->declare_parameter("exploration.viewpoint.strip_depth_m", 0.0);
@@ -1817,6 +1817,9 @@ void MIGHTY_NODE::terminalGoalCallbackImpl(const geometry_msgs::msg::PoseStamped
     unreachable_consec_count_ = 0;
     // Operator override of a return-home — start a fresh session.
     home_return_requested_ = false;
+    // A user goal preempts viewpoint navigation: drop the tight terminal-radius override
+    // so this ordinary goal uses the generic goal_radius.
+    endViewpointObservation();
   }
 
   // Set the terminal goal
@@ -1933,20 +1936,29 @@ void MIGHTY_NODE::issueViewpointGoal(const Eigen::Vector2d& xy, double yaw) {
   terminalGoalCallbackImpl(g, /*from_user=*/false);
 }
 
+void MIGHTY_NODE::endViewpointObservation() {
+  if (obs_phase_ != ObsPhase::IDLE) {
+    // Never let the tight viewpoint radius leak into a later ordinary MIGHTY goal.
+    mighty_ptr_->clearGoalRadiusOverride();
+    RCLCPP_INFO(this->get_logger(),
+      "[expl_view] terminal radius override OFF; restored generic radius=%.2f m",
+      par_.goal_radius);
+  }
+  obs_phase_ = ObsPhase::IDLE;
+}
+
 bool MIGHTY_NODE::tickViewpointObservation() {
   if (obs_phase_ == ObsPhase::IDLE) return false;
 
   state cur;
   mighty_ptr_->getState(cur);
   const Eigen::Vector2d p(cur.pos.x(), cur.pos.y());
-  const double tol = par_.expl_viewpoint.arrival_tol_m;
-  // MIGHTY declares GOAL_REACHED at goal_radius (looser than tol); accept it as a
-  // deadlock-safe arrival so the machine can't stall waiting for a tighter tolerance
-  // the ground controller won't drive to.
-  const bool generic_reached = mighty_ptr_->goalReachedCheck();
+  const double tol = par_.expl_viewpoint.arrival_tol_m;  // core MIGHTY drives to this via override
 
   if (obs_phase_ == ObsPhase::APPROACH_PRE) {
-    if ((p - obs_q_pre_).norm() < tol || generic_reached) {
+    const double d = (p - obs_q_pre_).norm();
+    if (d <= tol) {
+      RCLCPP_INFO(this->get_logger(), "[expl_view] reached q_pre: d=%.3f m (<= %.2f)", d, tol);
       issueViewpointGoal(obs_q_, obs_yaw_);  // stage 2: the q_pre->q* leg sets the heading
       obs_phase_ = ObsPhase::APPROACH_Q;
     }
@@ -1954,12 +1966,8 @@ bool MIGHTY_NODE::tickViewpointObservation() {
   }
   if (obs_phase_ == ObsPhase::APPROACH_Q) {
     const double d = (p - obs_q_).norm();
-    if (d < tol || generic_reached) {
-      if (d > tol) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "[expl_view] arrived %.2fm from q* (goal_radius stop, tol=%.2fm) — observation "
-          "geometry may be degraded", d, tol);
-      }
+    if (d <= tol) {
+      RCLCPP_INFO(this->get_logger(), "[expl_view] reached q*: d=%.3f m (<= %.2f)", d, tol);
       obs_dwell_start_t_ = this->now().seconds();
       obs_phase_ = ObsPhase::DWELL;
     }
@@ -1977,11 +1985,11 @@ bool MIGHTY_NODE::tickViewpointObservation() {
     RCLCPP_INFO(this->get_logger(),
       "[expl_view] frontier=%lu observation SUCCESS R=%.2f (>=%.2f) — releasing to WFD",
       static_cast<unsigned long>(obs_frontier_id_), R, par_.expl_viewpoint.min_reveal_fraction);
-    obs_phase_ = ObsPhase::IDLE;
+    endViewpointObservation();
     exploration_active_ = false;
     return true;
   }
-  // R below threshold -> try the next ranked alternate viewpoint.
+  // R below threshold -> try the next ranked alternate viewpoint (override stays active).
   ++obs_alt_idx_;
   if (obs_alt_idx_ < obs_ranked_.size()) {
     const auto& vp = obs_ranked_[obs_alt_idx_];
@@ -1999,7 +2007,7 @@ bool MIGHTY_NODE::tickViewpointObservation() {
     "[expl_view] frontier=%lu R=%.2f, all %zu viewpoints exhausted — INVALIDATE + cooldown",
     static_cast<unsigned long>(obs_frontier_id_), R, obs_ranked_.size());
   if (frontier_manager_) frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
-  obs_phase_ = ObsPhase::IDLE;
+  endViewpointObservation();
   exploration_active_ = false;
   return true;
 }
@@ -3641,6 +3649,7 @@ void MIGHTY_NODE::exploreSelectCallback() {
       home_return_requested_ = true;
     }
     exploration_active_ = false;
+    endViewpointObservation();  // defensive: no viewpoint radius override survives return-home
     // Note: exploration_start_captured_ is intentionally NOT reset here.
     // While the robot is en route home, new frontiers may be discovered as the
     // map updates, causing exploreSelectCallback to auto-restart. Resetting
@@ -3674,6 +3683,11 @@ void MIGHTY_NODE::exploreSelectCallback() {
       obs_q_pre_       = vp.q_pre;
       obs_yaw_         = vp.yaw;
       obs_phase_       = ObsPhase::APPROACH_PRE;
+      // Core MIGHTY must drive to the tight viewpoint tolerance for BOTH q_pre and q*,
+      // not stop at the generic goal_radius. Scoped override, cleared on every exit.
+      mighty_ptr_->setGoalRadiusOverride(par_.expl_viewpoint.arrival_tol_m);
+      RCLCPP_INFO(this->get_logger(), "[expl_view] terminal radius override ON: %.2f m",
+                  par_.expl_viewpoint.arrival_tol_m);
       issueViewpointGoal(obs_q_pre_, obs_yaw_);  // stage 1: drive to q_pre (final leg faces target)
       RCLCPP_INFO(this->get_logger(),
         "[expl_view] frontier=%lu C=(%.2f,%.2f) pca=%.2f n=(%.2f,%.2f) s=%.2f q*=(%.2f,%.2f) "
@@ -3691,7 +3705,7 @@ void MIGHTY_NODE::exploreSelectCallback() {
         "[expl_view] frontier=%lu no viewpoint: %s (%.2f ms) — invalidate + cooldown",
         static_cast<unsigned long>(next->id), mighty::viewpointRejectStr(vp.reason), vp_ms);
       frontier_manager_->markInvalidated(next->id, this->now().seconds());
-      obs_phase_ = ObsPhase::IDLE;
+      endViewpointObservation();  // clears any override, sets IDLE
       return;
     } else {
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -3709,8 +3723,8 @@ void MIGHTY_NODE::exploreSelectCallback() {
     g.pose.position.y    = next->centroid_xy.y();
     g.pose.position.z    = par_.expl_default_goal_z;
     g.pose.orientation.w = 1.0;
+    endViewpointObservation();  // legacy centroid path: ensure no viewpoint override lingers
     terminalGoalCallbackImpl(g, /*from_user=*/false);
-    obs_phase_ = ObsPhase::IDLE;
   }
 
   RCLCPP_INFO(this->get_logger(),

@@ -86,9 +86,11 @@ TEST(FrontierViewpoint, SignStabilityWithPrev) {
 
 // TEST 4 -- compact/ambiguous cluster => PCA invalid.
 TEST(FrontierViewpoint, CompactClusterInvalid) {
-  std::vector<Eigen::Vector2d> cells = {
-      {0.0, 0.0}, {0.15, 0.0}, {0.0, 0.15}, {0.15, 0.15}, {0.0, -0.15}, {0.15, -0.15}};
-  GridQuery grid = halfPlaneGrid([](double x, double) { return x > 0.15; });
+  // A near-square 3x3 blob has sxx ~= syy -> anisotropy ~= 1 -> no dominant direction.
+  std::vector<Eigen::Vector2d> cells;
+  for (double y = 0.0; y <= 0.30 + 1e-9; y += 0.15)
+    for (double x = 0.0; x <= 0.30 + 1e-9; x += 0.15) cells.emplace_back(x, y);
+  GridQuery grid = halfPlaneGrid([](double x, double) { return x > 0.30; });
   ViewpointParams P = baseParams();
   P.pca_min_anisotropy = 2.0;
 
@@ -132,10 +134,15 @@ TEST(FrontierViewpoint, SmallestValidLateral) {
   // Unknown: above the frontier, PLUS a small unknown blob exactly under q(s=0)=(0,-0.75).
   auto unknown = [&](double x, double y) {
     if (y > 0.0) return true;
-    return std::hypot(x - 0.0, y - (-standoff)) < 0.12;  // small patch under s=0
+    return std::hypot(x - 0.0, y - (-standoff)) < 0.05;  // tiny patch under s=0
   };
   GridQuery grid = halfPlaneGrid(unknown);
   ViewpointParams P = baseParams();
+  // Small footprint so a single lateral step can clear the tiny patch (the default
+  // 0.6 m box needs ~0.5 m of lateral to move the disc off a centerline obstacle).
+  P.robot_bbox_x = 0.1;
+  P.robot_bbox_y = 0.1;
+  P.footprint_margin_m = 0.0;
   P.standoff_m = standoff;
   P.lateral_step_m = step;
   P.max_lateral_offset_m = 1.5;
@@ -182,15 +189,18 @@ TEST(FrontierViewpoint, TargetOutsideVerticalFov) {
   Eigen::Vector2d q(0.0, 0.0), g(0.05, 0.0);
   EXPECT_FALSE(targetPotentiallyVisible(q, g, /*depth=*/0.5, /*standoff=*/0.75, grid, P));
   // A geometrically reasonable target passes (depth clears lip, depression in window).
-  Eigen::Vector2d g2(1.2, 0.0);
+  // At horiz<~1.3 m the 27deg depression limit rejects it, so use a target further out.
+  Eigen::Vector2d g2(1.5, 0.0);
   EXPECT_TRUE(targetPotentiallyVisible(q, g2, /*depth=*/0.5, /*standoff=*/0.75, grid, P));
 }
 
 // TEST 11 -- target hidden by the curb lip (depth < H*d/h) is rejected.
 TEST(FrontierViewpoint, TargetHiddenByLip) {
   GridQuery grid = halfPlaneGrid([](double, double) { return false; });
-  ViewpointParams P = baseParams();  // H=0.15, d=0.75, h=0.51 -> threshold ~0.2206 m
-  Eigen::Vector2d q(0.0, 0.0), g(1.0, 0.0);
+  ViewpointParams P = baseParams();  // H=0.15, d=0.75, h=0.51 -> lip threshold ~0.2206 m
+  // Target far enough out (1.5 m) that the vertical FOV passes, so this isolates the lip:
+  // depth<0.22 is lip-occluded (reject); depth>0.22 clears the lip (accept).
+  Eigen::Vector2d q(0.0, 0.0), g(1.5, 0.0);
   EXPECT_FALSE(targetPotentiallyVisible(q, g, /*depth=*/0.10, /*standoff=*/0.75, grid, P));
   EXPECT_TRUE(targetPotentiallyVisible(q, g, /*depth=*/0.40, /*standoff=*/0.75, grid, P));
 }

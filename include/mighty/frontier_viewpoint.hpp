@@ -51,7 +51,7 @@ struct ViewpointParams {
   // the path-direction yaw behavior -- NOT from a fake in-place turn, which the hardware
   // controller cannot command). The segment must be footprint/ESDF safe.
   double pre_viewpoint_len_m     = 0.50;   // l [m]
-  double arrival_tol_m           = 0.22;   // dedicated viewpoint arrival tolerance (node)
+  double arrival_tol_m           = 0.25;   // dedicated viewpoint arrival tolerance (node + MIGHTY override)
   // Reveal test (post-dwell): a PCA-aligned strip BEHIND the frontier is snapshotted for
   // UNKNOWN cells at selection; after the dwell, R = 1 - N_unknown_after/N_unknown_before.
   // R >= min_reveal_fraction => the VIEWPOINT succeeded (this does NOT by itself mark the

@@ -350,7 +350,13 @@ bool MIGHTY::needReplan(const state& local_state, const state& local_G_term,
   double dist_to_term_G = (local_state.pos - local_G_term.pos).norm();
   double dist_from_last_plan_state_to_term_G = (last_plan_state.pos - local_G_term.pos).norm();
 
-  if (dist_to_term_G < par_.goal_radius) {
+  // Terminal-goal completion radius: the scoped override when active (frontier viewpoint
+  // navigation needs a tight arrival tolerance), else the generic par_.goal_radius. This
+  // applies ONLY to the two terminal-goal completion tests below; the corridor-hop
+  // intermediate-subgoal check further down keeps the generic radius.
+  const double active_goal_radius = goal_radius_override_.radius(par_.goal_radius);
+
+  if (dist_to_term_G < active_goal_radius) {
     changeDroneStatus(DroneStatus::GOAL_REACHED);
     return false;
   }
@@ -361,7 +367,7 @@ bool MIGHTY::needReplan(const state& local_state, const state& local_G_term,
   }
 
   if (drone_status_ == DroneStatus::GOAL_SEEN &&
-      dist_from_last_plan_state_to_term_G < par_.goal_radius) {
+      dist_from_last_plan_state_to_term_G < active_goal_radius) {
     return false;
   }
 

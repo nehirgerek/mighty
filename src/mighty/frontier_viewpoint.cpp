@@ -123,6 +123,10 @@ ViewpointReject footprintCheck(const Eigen::Vector2d& q, const GridQuery& grid,
   const double r2 = r_safe * r_safe;
   const double step = std::max(1e-3, grid.resolution);
   bool any_occ = false, any_unk = false;
+  // Always check the cell under q (robust when r_safe < grid.resolution, where the
+  // disc sampling below could otherwise step over every cell center).
+  if (grid.isOccupied && grid.isOccupied(q.x(), q.y())) any_occ = true;
+  else if (grid.isFree && !grid.isFree(q.x(), q.y())) any_unk = true;
   for (double dy = -r_safe; dy <= r_safe + 1e-9; dy += step) {
     for (double dx = -r_safe; dx <= r_safe + 1e-9; dx += step) {
       if (dx * dx + dy * dy > r2) continue;  // cell center outside the disc

@@ -22,6 +22,7 @@
 
 #include "hgp/hgp_manager.hpp"
 #include "hgp/termcolor.hpp"
+#include "mighty/goal_radius_override.hpp"
 #include "mighty/mighty_type.hpp"
 
 #include "timer.hpp"
@@ -203,6 +204,18 @@ class MIGHTY {
    *  @param term_goal New terminal goal state.
    */
   void setTerminalGoal(const state& term_goal);
+
+  /** @brief Activate a scoped terminal-goal radius override (used by the frontier
+   *  viewpoint state machine so core MIGHTY drives to the tight arrival tolerance
+   *  instead of the generic goal_radius). Applies ONLY to terminal-goal completion in
+   *  needReplan(); intermediate/corridor-hop subgoals keep the generic radius. */
+  void setGoalRadiusOverride(double radius) { goal_radius_override_.set(radius); }
+
+  /** @brief Deactivate the terminal-goal radius override (restore generic goal_radius). */
+  void clearGoalRadiusOverride() { goal_radius_override_.clear(); }
+
+  /** @brief The terminal radius currently in effect (override if active, else generic). */
+  double activeGoalRadius() const { return goal_radius_override_.radius(par_.goal_radius); }
 
   /** @brief If the goal lies in an occupied voxel, relocate it to the nearest
    *         free/unknown cell pushed outward by ||drone_bbox|| along the
@@ -513,6 +526,10 @@ class MIGHTY {
   state A_;                                         // Starting point of the drone
   double A_time_;                                   // Time of the starting point
   state E_;                                         // The goal point of actual trajectory
+  // Scoped terminal-goal radius override (frontier viewpoint navigation). Inactive by
+  // default; when active it replaces par_.goal_radius ONLY in needReplan()'s
+  // terminal-goal completion checks. See goal_radius_override.hpp.
+  mighty::GoalRadiusOverride goal_radius_override_;
   state G_term_;                                    // Terminal goal
   std::deque<state> plan_;                          // Plan for the drone
   std::deque<std::vector<state>> plan_safe_paths_;  // Indicate if the state has a safe path

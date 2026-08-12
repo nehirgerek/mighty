@@ -334,6 +334,10 @@ class MIGHTY_NODE : public rclcpp::Node {
   /** @brief Drive the viewpoint approach/dwell/reveal machine.
    *  @return true if the machine is active and handled this tick (skip generic arrival). */
   bool tickViewpointObservation();
+  /** @brief End viewpoint navigation: clear the terminal-radius override and set IDLE.
+   *  Safe to call unconditionally; no-op when already IDLE. Prevents the tight viewpoint
+   *  radius from leaking into a later ordinary MIGHTY goal. */
+  void endViewpointObservation();
   // Wall-clock seconds of the last successful publishVisitedMap() call.
   // Used to throttle the (potentially large) tristate-grid publish to ~1 Hz
   // — RViz only needs occasional updates because the persistent map only
