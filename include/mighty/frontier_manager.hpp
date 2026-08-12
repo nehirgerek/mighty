@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "mighty/frontier_detector.hpp"
+#include "mighty/frontier_viewpoint.hpp"  // mighty::FrontierGeometry
 #include "mighty/occ_grid_2d.hpp"
 #include "mighty/peer_tracker.hpp"
 
@@ -52,6 +53,15 @@ struct FrontierRecord {
   // re-spawning a brand-new ACTIVE record right next to a frontier we just
   // gave up on. See invalidation_keep_out_radius_m / cooldown_sec params.
   double          invalidated_at_t = -1.0;
+  // Persistent PCA geometry (tangent / UNKNOWN-facing normal / validity), recomputed
+  // from the matched/new cluster cells in update() with sign-alignment to the prior
+  // estimate. Consumed by the perception-aware viewpoint selector.
+  mighty::FrontierGeometry geometry;
+  // True while this record is the actively-pursued observation goal. Set by
+  // markSelected(); cleared by markVisited()/markInvalidated(). Prevents the generic
+  // robot-proximity dwell rule (update step f) from marking it VISITED while the rover
+  // sits at an offset observation viewpoint.
+  bool            is_being_pursued = false;
 };
 
 struct FrontierManagerParams {
@@ -62,6 +72,10 @@ struct FrontierManagerParams {
   double visit_dwell_sec           = 1.0;
   int    verify_radius_cells       = 2;
   int    max_frontiers             = 1000;
+
+  // PCA geometry (used to fill FrontierRecord::geometry in update()).
+  double pca_min_anisotropy        = 1.5;
+  double normal_probe_m            = 0.30;
 
   // Ranking weights (additive). All weights >= 0; set a weight to 0 to disable
   // the corresponding term.

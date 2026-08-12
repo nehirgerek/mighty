@@ -16,6 +16,7 @@
 
 #include <Eigen/Core>
 
+#include <mighty/frontier_viewpoint.hpp>  // mighty::ViewpointParams
 #include <mighty/lbfgs_solver_utils.hpp>
 #include <sim/exprtk.hpp>
 
@@ -356,6 +357,10 @@ struct parameters {
   double expl_pursuit_timeout_factor{10.0};
   double expl_pursuit_timeout_v_ref{0.5};
   double expl_pursuit_timeout_min_sec{10.0};
+  // Perception-aware frontier viewpoint selector (curb/step safety). Filled from the
+  // exploration.viewpoint.* params in setParameters(); robot_bbox_x/y come from drone_bbox.
+  mighty::ViewpointParams expl_viewpoint;
+  double expl_view_observation_dwell_sec{0.5};  // dwell at the viewpoint before VISITED
   // Invalidation keep-out — drop fresh clusters that fall within radius_m of
   // any INVALIDATED record whose invalidation is still inside the cooldown
   // window. Set radius_m <= 0 to disable; cooldown_sec <= 0 = permanent.

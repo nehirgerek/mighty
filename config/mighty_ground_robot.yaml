@@ -373,6 +373,32 @@ mighty_node:
         # memory: 100x100m at 0.15m = ~56 KB. Bump width/height_m if missions
         # cover a larger area; cells outside this box default to "not visited"
         # and so will not be filtered.
+        # --- Perception-aware frontier viewpoint (curb / negative-obstacle safety) ---
+        # Instead of driving to the FREE/UNKNOWN frontier centroid (which may sit at the
+        # lip of a downward step), pick a safe standoff pose that can geometrically
+        # observe the unknown terrain behind the frontier, then face it.
+        exploration.viewpoint.enabled: true                      # [-] Use the viewpoint selector (false = legacy centroid goal)
+        exploration.viewpoint.standoff_m: 0.75                   # [m] perpendicular center->viewpoint distance d
+        exploration.viewpoint.lateral_step_m: 0.15               # [m] tangent search step (~map res)
+        exploration.viewpoint.max_lateral_offset_m: 1.50         # [m] max |s| lateral search
+        exploration.viewpoint.footprint_margin_m: 0.10           # [m] added to the footprint/turn radius for the free-disc check
+        exploration.viewpoint.min_esdf_clearance_m: 0.70         # [m] required ESDF clearance at the viewpoint (if ESDF available)
+        exploration.viewpoint.pca_min_anisotropy: 1.5            # [-] min lambda_max/lambda_min for a valid frontier direction
+        exploration.viewpoint.normal_probe_m: 0.30               # [m] probe distance to resolve the normal sign toward UNKNOWN
+        exploration.viewpoint.target_depths_m: [0.25, 0.40, 0.55, 0.70]  # [m] hypothetical target depths behind the frontier
+        exploration.viewpoint.critical_drop_m: 0.15              # [m] hypothetical downward step H for the lip/FOV geometry
+        exploration.viewpoint.min_visible_fraction: 0.50         # [-] accept if visible/total target samples >= this
+        exploration.viewpoint.sensor_height_m: 0.51              # [m] Mid-360 height above ground (HW)
+        exploration.viewpoint.sensor_mount_pitch_deg: 20.0       # [deg] forward (nose-down) mount pitch
+        exploration.viewpoint.sensor_vertical_min_deg: -7.0      # [deg] native vertical FOV lower bound
+        exploration.viewpoint.sensor_vertical_max_deg: 52.0      # [deg] native vertical FOV upper bound
+        exploration.viewpoint.observation_dwell_sec: 0.5         # [s] dwell at the viewpoint before marking observed
+        exploration.viewpoint.fallback_to_legacy_centroid: false # [-] on selector failure: false = skip/invalidate frontier; true = old centroid goal
+        exploration.viewpoint.pre_offset_m: 0.50                 # [m] l: pre-viewpoint standoff so the final leg q_pre->q* faces the target (approach heading)
+        exploration.viewpoint.arrival_tol_m: 0.22                # [m] dedicated viewpoint arrival tolerance (tighter than goal_radius)
+        exploration.viewpoint.min_reveal_fraction: 0.30          # [-] R = 1 - N_unknown_after/N_unknown_before; R>=this => viewpoint succeeded (does NOT itself mark VISITED)
+        exploration.viewpoint.strip_half_width_m: 0.75           # [m] lateral (tangent) half-extent of the PCA-aligned reveal strip behind the frontier
+        exploration.viewpoint.strip_depth_m: 0.0                 # [m] along-normal strip depth; 0 => use max(target_depths_m)
         exploration.visited_map.center_x: 0.0                    # [m]   bitmap center x (world frame)
         exploration.visited_map.center_y: 0.0                    # [m]   bitmap center y (world frame)
         exploration.visited_map.width_m: 100.0                   # [m]   total extent (must cover full mission area)

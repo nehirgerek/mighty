@@ -358,6 +358,8 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
       mp.invalidation_keep_out_radius_m = par_.expl_invalidation_keep_out_radius_m;
       mp.invalidation_cooldown_sec      = par_.expl_invalidation_cooldown_sec;
       mp.peer_visit_radius_m            = par_.expl_peer_visit_radius_m;
+      mp.pca_min_anisotropy             = par_.expl_viewpoint.pca_min_anisotropy;
+      mp.normal_probe_m                 = par_.expl_viewpoint.normal_probe_m;
       frontier_manager_ = std::make_unique<FrontierManager>(mp);
 
       // Persistent visited bitmap. Records every cell ever observed across
@@ -774,6 +776,30 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("exploration.manager.pursuit_timeout_min_sec", 10.0);
   this->declare_parameter("exploration.manager.invalidation_keep_out_radius_m", 1.5);
   this->declare_parameter("exploration.manager.invalidation_cooldown_sec", 30.0);
+  // Perception-aware frontier viewpoint selector (curb/step safety).
+  this->declare_parameter("exploration.viewpoint.enabled", true);
+  this->declare_parameter("exploration.viewpoint.standoff_m", 0.75);
+  this->declare_parameter("exploration.viewpoint.lateral_step_m", 0.15);
+  this->declare_parameter("exploration.viewpoint.max_lateral_offset_m", 1.50);
+  this->declare_parameter("exploration.viewpoint.footprint_margin_m", 0.10);
+  this->declare_parameter("exploration.viewpoint.min_esdf_clearance_m", 0.70);
+  this->declare_parameter("exploration.viewpoint.pca_min_anisotropy", 1.5);
+  this->declare_parameter("exploration.viewpoint.normal_probe_m", 0.30);
+  this->declare_parameter("exploration.viewpoint.target_depths_m",
+                          std::vector<double>{0.25, 0.40, 0.55, 0.70});
+  this->declare_parameter("exploration.viewpoint.critical_drop_m", 0.15);
+  this->declare_parameter("exploration.viewpoint.min_visible_fraction", 0.50);
+  this->declare_parameter("exploration.viewpoint.sensor_height_m", 0.51);
+  this->declare_parameter("exploration.viewpoint.sensor_mount_pitch_deg", 20.0);
+  this->declare_parameter("exploration.viewpoint.sensor_vertical_min_deg", -7.0);
+  this->declare_parameter("exploration.viewpoint.sensor_vertical_max_deg", 52.0);
+  this->declare_parameter("exploration.viewpoint.observation_dwell_sec", 0.5);
+  this->declare_parameter("exploration.viewpoint.fallback_to_legacy_centroid", false);
+  this->declare_parameter("exploration.viewpoint.pre_offset_m", 0.50);
+  this->declare_parameter("exploration.viewpoint.arrival_tol_m", 0.22);
+  this->declare_parameter("exploration.viewpoint.min_reveal_fraction", 0.30);
+  this->declare_parameter("exploration.viewpoint.strip_half_width_m", 0.75);
+  this->declare_parameter("exploration.viewpoint.strip_depth_m", 0.0);
   this->declare_parameter("exploration.visited_map.center_x", 0.0);
   this->declare_parameter("exploration.visited_map.center_y", 0.0);
   this->declare_parameter("exploration.visited_map.width_m", 100.0);
@@ -1141,6 +1167,38 @@ void MIGHTY_NODE::setParameters() {
       this->get_parameter("exploration.manager.invalidation_keep_out_radius_m").as_double();
   par_.expl_invalidation_cooldown_sec =
       this->get_parameter("exploration.manager.invalidation_cooldown_sec").as_double();
+  {
+    auto& vp = par_.expl_viewpoint;
+    vp.enabled              = this->get_parameter("exploration.viewpoint.enabled").as_bool();
+    vp.standoff_m           = this->get_parameter("exploration.viewpoint.standoff_m").as_double();
+    vp.lateral_step_m       = this->get_parameter("exploration.viewpoint.lateral_step_m").as_double();
+    vp.max_lateral_offset_m = this->get_parameter("exploration.viewpoint.max_lateral_offset_m").as_double();
+    vp.footprint_margin_m   = this->get_parameter("exploration.viewpoint.footprint_margin_m").as_double();
+    vp.min_esdf_clearance_m = this->get_parameter("exploration.viewpoint.min_esdf_clearance_m").as_double();
+    vp.pca_min_anisotropy   = this->get_parameter("exploration.viewpoint.pca_min_anisotropy").as_double();
+    vp.normal_probe_m       = this->get_parameter("exploration.viewpoint.normal_probe_m").as_double();
+    vp.target_depths_m      = this->get_parameter("exploration.viewpoint.target_depths_m").as_double_array();
+    vp.critical_drop_m      = this->get_parameter("exploration.viewpoint.critical_drop_m").as_double();
+    vp.min_visible_fraction = this->get_parameter("exploration.viewpoint.min_visible_fraction").as_double();
+    vp.sensor_height_m         = this->get_parameter("exploration.viewpoint.sensor_height_m").as_double();
+    vp.sensor_mount_pitch_deg  = this->get_parameter("exploration.viewpoint.sensor_mount_pitch_deg").as_double();
+    vp.sensor_vertical_min_deg = this->get_parameter("exploration.viewpoint.sensor_vertical_min_deg").as_double();
+    vp.sensor_vertical_max_deg = this->get_parameter("exploration.viewpoint.sensor_vertical_max_deg").as_double();
+    vp.fallback_to_legacy_centroid =
+        this->get_parameter("exploration.viewpoint.fallback_to_legacy_centroid").as_bool();
+    vp.pre_viewpoint_len_m  = this->get_parameter("exploration.viewpoint.pre_offset_m").as_double();
+    vp.arrival_tol_m        = this->get_parameter("exploration.viewpoint.arrival_tol_m").as_double();
+    vp.min_reveal_fraction  = this->get_parameter("exploration.viewpoint.min_reveal_fraction").as_double();
+    vp.strip_half_width_m   = this->get_parameter("exploration.viewpoint.strip_half_width_m").as_double();
+    vp.strip_depth_m        = this->get_parameter("exploration.viewpoint.strip_depth_m").as_double();
+    // Footprint radius source = configured XY bounding box (drone_bbox read earlier).
+    if (par_.drone_bbox.size() >= 2) {
+      vp.robot_bbox_x = par_.drone_bbox[0];
+      vp.robot_bbox_y = par_.drone_bbox[1];
+    }
+    par_.expl_view_observation_dwell_sec =
+        this->get_parameter("exploration.viewpoint.observation_dwell_sec").as_double();
+  }
   par_.expl_visited_map_center_x   = this->get_parameter("exploration.visited_map.center_x").as_double();
   par_.expl_visited_map_center_y   = this->get_parameter("exploration.visited_map.center_y").as_double();
   par_.expl_visited_map_width_m    = this->get_parameter("exploration.visited_map.width_m").as_double();

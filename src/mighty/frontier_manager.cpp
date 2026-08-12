@@ -31,6 +31,20 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
   const double dt = (last_update_t_ > 0.0) ? std::max(0.0, t_now - last_update_t_)
                                            : 0.0;
 
+  // PCA geometry inputs: a world-coord GridQuery over the current grid (for the
+  // normal-sign probe) and a minimal ViewpointParams carrying the PCA thresholds.
+  mighty::GridQuery pca_gq;
+  pca_gq.resolution = current_grid.resolution();
+  pca_gq.isUnknown = [&current_grid](double x, double y) { return current_grid.isUnknownWorld(x, y); };
+  pca_gq.isFree = [&current_grid](double x, double y) { return current_grid.isFreeWorld(x, y); };
+  pca_gq.isOccupied = [&current_grid](double x, double y) { return current_grid.isOccupiedWorld(x, y); };
+  mighty::ViewpointParams pca_vp;
+  pca_vp.pca_min_anisotropy = params_.pca_min_anisotropy;
+  pca_vp.normal_probe_m = params_.normal_probe_m;
+  auto computeGeom = [&](const FrontierCluster& c, const mighty::FrontierGeometry* prev) {
+    return mighty::computeFrontierGeometry(c.cells, pca_gq, pca_vp, prev);
+  };
+
   // ---- Step a/b: brute-force greedy match fresh -> existing ----
   std::vector<int> match_for_fresh(fresh.size(), -1);
   std::vector<uint8_t> existing_matched(records_.size(), 0);
@@ -77,6 +91,8 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
         r.aabb_min    = c.aabb_min;
         r.aabb_max    = c.aabb_max;
         r.state       = FrontierState::ACTIVE;
+        // Recompute PCA geometry, sign-aligned to the prior estimate for stability.
+        r.geometry = computeGeom(c, r.geometry.valid ? &r.geometry : nullptr);
       }
     } else {
       // Suppress fresh clusters that fall inside the keep-out radius of a
@@ -111,6 +127,7 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
       r.first_seen_t = t_now;
       r.last_seen_t  = t_now;
       r.state        = FrontierState::ACTIVE;
+      r.geometry     = computeGeom(c, nullptr);
       records_.push_back(r);
       // The new record is implicitly "matched" — don't classify it as
       // unmatched-in-window in step d. Mark its slot as matched.
@@ -168,6 +185,13 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
   for (auto& r : records_) {
     if (r.state == FrontierState::VISITED ||
         r.state == FrontierState::INVALIDATED) {
+      continue;
+    }
+    // Part 9: the actively-pursued observation frontier must NOT be marked VISITED by
+    // the generic proximity dwell — the rover parks at an offset viewpoint (often within
+    // visit_radius_m). Resolution is decided by the WFD/verify path (steps d/e), not here.
+    if (r.is_being_pursued) {
+      r.dwell_time_sec = 0.0;
       continue;
     }
     const double d = (robot_xy - r.centroid_xy).norm();
@@ -387,6 +411,7 @@ void FrontierManager::markVisited(uint64_t id) {
       r.state = FrontierState::VISITED;
       r.pursuit_deadline_t = -1.0;
       r.pursuit_budget_sec = 0.0;
+      r.is_being_pursued = false;
       return;
     }
   }
@@ -399,6 +424,7 @@ void FrontierManager::markInvalidated(uint64_t id, double t_now) {
       r.invalidated_at_t = t_now;
       r.pursuit_deadline_t = -1.0;
       r.pursuit_budget_sec = 0.0;
+      r.is_being_pursued = false;
       return;
     }
   }
@@ -406,7 +432,12 @@ void FrontierManager::markInvalidated(uint64_t id, double t_now) {
 
 void FrontierManager::markSelected(uint64_t id, const Eigen::Vector2d& robot_xy,
                                    double t_now) {
-  if (params_.pursuit_timeout_factor <= 0.0) return;  // feature disabled
+  // Mark the pursuit flag regardless of whether the timeout feature is enabled, so the
+  // proximity-dwell gate (Part 9) always applies to the pursued frontier.
+  for (auto& r : records_) {
+    if (r.id == id) { r.is_being_pursued = true; break; }
+  }
+  if (params_.pursuit_timeout_factor <= 0.0) return;  // deadline feature disabled
   for (auto& r : records_) {
     if (r.id != id) continue;
     // Don't clobber a deadline that's already armed for this record — we keep

@@ -73,7 +73,7 @@ endif()
 add_definitions(${PCL_DEFINITIONS})
 
 # add executables
-add_executable(mighty src/mighty/mighty_node.cpp src/mighty/mighty.cpp src/hgp/hgp_manager.cpp src/hgp/utils.cpp src/hgp/hgp_planner.cpp src/hgp/graph_search.cpp src/mighty/utils.cpp src/mighty/lbfgs_solver.cpp src/mighty/lbfgs_solver_utils.cpp src/mighty/frontier_detector.cpp src/mighty/frontier_manager.cpp)
+add_executable(mighty src/mighty/mighty_node.cpp src/mighty/mighty.cpp src/hgp/hgp_manager.cpp src/hgp/utils.cpp src/hgp/hgp_planner.cpp src/hgp/graph_search.cpp src/mighty/utils.cpp src/mighty/lbfgs_solver.cpp src/mighty/lbfgs_solver_utils.cpp src/mighty/frontier_detector.cpp src/mighty/frontier_manager.cpp src/mighty/frontier_viewpoint.cpp)
 target_link_libraries(mighty ${PCL_LIBRARIES})
 ament_target_dependencies(mighty rclcpp example_interfaces dynus_interfaces visualization_msgs Eigen3 decomp_ros_msgs sensor_msgs std_msgs nav_msgs decomp_rviz_plugins decomp_test_node tf2_geometry_msgs tf2 tf2_ros tf2_eigen std_srvs pcl_ros)
 
@@ -190,6 +190,12 @@ if(BUILD_TESTING)
     src/mighty/frontier_detector.cpp)
   ament_target_dependencies(test_frontier_detector
     rclcpp Eigen3 nav_msgs)
+
+  ament_add_gtest(test_frontier_viewpoint
+    src/test/test_frontier_viewpoint.cpp
+    src/mighty/frontier_viewpoint.cpp)
+  ament_target_dependencies(test_frontier_viewpoint
+    Eigen3)
 
   ament_add_gtest(test_frontier_manager
     src/test/test_frontier_manager.cpp
