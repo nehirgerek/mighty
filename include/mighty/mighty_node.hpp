@@ -313,6 +313,27 @@ class MIGHTY_NODE : public rclcpp::Node {
   // and stop accepting new frontier goals (so it stays parked once arrived).
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr sub_return_home_;
   bool home_return_requested_ = false;
+
+  // --- Perception-aware viewpoint observation state machine (ground robot) ---
+  //   select frontier -> selectViewpoint -> drive q_pre -> q* -> dwell -> reveal R
+  //   R>=thresh: success (release to WFD) ; R<thresh: next alternate / invalidate.
+  enum class ObsPhase { IDLE, APPROACH_PRE, APPROACH_Q, DWELL };
+  ObsPhase obs_phase_ = ObsPhase::IDLE;
+  std::vector<mighty::ViewpointPose> obs_ranked_;    // ranked alternates for current frontier
+  size_t   obs_alt_idx_ = 0;
+  std::vector<Eigen::Vector2d> obs_strip_snapshot_;  // UNKNOWN strip cells snapshotted at selection
+  Eigen::Vector2d obs_q_{0.0, 0.0};
+  Eigen::Vector2d obs_q_pre_{0.0, 0.0};
+  double   obs_yaw_ = 0.0;
+  double   obs_dwell_start_t_ = -1.0;
+  uint64_t obs_frontier_id_ = 0;
+  /** @brief GridQuery over the current detection grid (+ESDF) for the viewpoint selector. */
+  mighty::GridQuery buildViewpointGridQuery() const;
+  /** @brief Issue an exploration terminal goal at (xy, yaw) via terminalGoalCallbackImpl. */
+  void issueViewpointGoal(const Eigen::Vector2d& xy, double yaw);
+  /** @brief Drive the viewpoint approach/dwell/reveal machine.
+   *  @return true if the machine is active and handled this tick (skip generic arrival). */
+  bool tickViewpointObservation();
   // Wall-clock seconds of the last successful publishVisitedMap() call.
   // Used to throttle the (potentially large) tristate-grid publish to ~1 Hz
   // — RViz only needs occasional updates because the persistent map only

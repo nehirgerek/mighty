@@ -1906,7 +1906,107 @@ void MIGHTY_NODE::publishVelocityInText(const Eigen::Vector3d& position, double 
 /**
  * @brief Callback function to check if the goal is reached
  */
+mighty::GridQuery MIGHTY_NODE::buildViewpointGridQuery() const {
+  mighty::GridQuery gq;
+  auto grid = current_detect_grid_;  // shared_ptr copy: keep alive for the callbacks
+  gq.resolution = grid ? grid->resolution() : par_.mighty_map_res;
+  gq.isFree     = [grid](double x, double y) { return grid && grid->isFreeWorld(x, y); };
+  gq.isUnknown  = [grid](double x, double y) { return !grid || grid->isUnknownWorld(x, y); };
+  gq.isOccupied = [grid](double x, double y) { return grid && grid->isOccupiedWorld(x, y); };
+  auto esdf = esdf_grid_;
+  if (esdf) {
+    gq.esdfInBounds = [esdf](double x, double y) { return esdf->isInBounds(x, y); };
+    gq.esdfDistance = [esdf](double x, double y) { return esdf->queryDistance(x, y); };
+  }
+  return gq;
+}
+
+void MIGHTY_NODE::issueViewpointGoal(const Eigen::Vector2d& xy, double yaw) {
+  geometry_msgs::msg::PoseStamped g;
+  g.header.frame_id    = par_.map_frame_id;
+  g.header.stamp       = this->now();
+  g.pose.position.x    = xy.x();
+  g.pose.position.y    = xy.y();
+  g.pose.position.z    = par_.expl_default_goal_z;
+  g.pose.orientation.z = std::sin(yaw * 0.5);  // desired observation yaw hint
+  g.pose.orientation.w = std::cos(yaw * 0.5);
+  terminalGoalCallbackImpl(g, /*from_user=*/false);
+}
+
+bool MIGHTY_NODE::tickViewpointObservation() {
+  if (obs_phase_ == ObsPhase::IDLE) return false;
+
+  state cur;
+  mighty_ptr_->getState(cur);
+  const Eigen::Vector2d p(cur.pos.x(), cur.pos.y());
+  const double tol = par_.expl_viewpoint.arrival_tol_m;
+  // MIGHTY declares GOAL_REACHED at goal_radius (looser than tol); accept it as a
+  // deadlock-safe arrival so the machine can't stall waiting for a tighter tolerance
+  // the ground controller won't drive to.
+  const bool generic_reached = mighty_ptr_->goalReachedCheck();
+
+  if (obs_phase_ == ObsPhase::APPROACH_PRE) {
+    if ((p - obs_q_pre_).norm() < tol || generic_reached) {
+      issueViewpointGoal(obs_q_, obs_yaw_);  // stage 2: the q_pre->q* leg sets the heading
+      obs_phase_ = ObsPhase::APPROACH_Q;
+    }
+    return true;
+  }
+  if (obs_phase_ == ObsPhase::APPROACH_Q) {
+    const double d = (p - obs_q_).norm();
+    if (d < tol || generic_reached) {
+      if (d > tol) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[expl_view] arrived %.2fm from q* (goal_radius stop, tol=%.2fm) — observation "
+          "geometry may be degraded", d, tol);
+      }
+      obs_dwell_start_t_ = this->now().seconds();
+      obs_phase_ = ObsPhase::DWELL;
+    }
+    return true;
+  }
+
+  // DWELL: wait, then measure the real reveal over the snapshotted strip.
+  if (this->now().seconds() - obs_dwell_start_t_ < par_.expl_view_observation_dwell_sec) return true;
+  const mighty::GridQuery gq = buildViewpointGridQuery();
+  const double R = mighty::revealFraction(obs_strip_snapshot_, gq);
+  if (R >= par_.expl_viewpoint.min_reveal_fraction) {
+    // Success: DO NOT mark VISITED here. Release the goal so the next select tick
+    // re-runs WFD/matching, which decides residual (continue) vs resolved (VISITED) vs
+    // occupied (INVALIDATED).
+    RCLCPP_INFO(this->get_logger(),
+      "[expl_view] frontier=%lu observation SUCCESS R=%.2f (>=%.2f) — releasing to WFD",
+      static_cast<unsigned long>(obs_frontier_id_), R, par_.expl_viewpoint.min_reveal_fraction);
+    obs_phase_ = ObsPhase::IDLE;
+    exploration_active_ = false;
+    return true;
+  }
+  // R below threshold -> try the next ranked alternate viewpoint.
+  ++obs_alt_idx_;
+  if (obs_alt_idx_ < obs_ranked_.size()) {
+    const auto& vp = obs_ranked_[obs_alt_idx_];
+    obs_q_ = vp.q; obs_q_pre_ = vp.q_pre; obs_yaw_ = vp.yaw;
+    RCLCPP_INFO(this->get_logger(),
+      "[expl_view] frontier=%lu R=%.2f<%.2f — trying alternate %zu/%zu",
+      static_cast<unsigned long>(obs_frontier_id_), R, par_.expl_viewpoint.min_reveal_fraction,
+      obs_alt_idx_ + 1, obs_ranked_.size());
+    issueViewpointGoal(obs_q_pre_, obs_yaw_);
+    obs_phase_ = ObsPhase::APPROACH_PRE;
+    return true;
+  }
+  // Alternates exhausted -> invalidate + cooldown; another frontier gets picked.
+  RCLCPP_INFO(this->get_logger(),
+    "[expl_view] frontier=%lu R=%.2f, all %zu viewpoints exhausted — INVALIDATE + cooldown",
+    static_cast<unsigned long>(obs_frontier_id_), R, obs_ranked_.size());
+  if (frontier_manager_) frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
+  obs_phase_ = ObsPhase::IDLE;
+  exploration_active_ = false;
+  return true;
+}
+
 void MIGHTY_NODE::goalReachedCheckCallback() {
+  // The viewpoint machine owns arrival/dwell/reveal while pursuing an observation goal.
+  if (tickViewpointObservation()) return;
   if (!mighty_ptr_->goalReachedCheck()) return;
 
   if (use_benchmark_) {
@@ -3550,21 +3650,74 @@ void MIGHTY_NODE::exploreSelectCallback() {
     return;
   }
 
-  geometry_msgs::msg::PoseStamped g;
-  g.header.frame_id    = par_.map_frame_id;
-  g.header.stamp       = this->now();
-  g.pose.position.x    = next->centroid_xy.x();
-  g.pose.position.y    = next->centroid_xy.y();
-  g.pose.position.z    = par_.expl_default_goal_z;
-  g.pose.orientation.w = 1.0;
+  const Eigen::Vector2d robot_xy(robot_pose.x(), robot_pose.y());
+  bool issued_viewpoint = false;
+
+  // Perception-aware viewpoint: pick a safe standoff pose that can observe behind the
+  // frontier (curb/step safety) instead of driving onto the FREE/UNKNOWN boundary.
+  if (par_.expl_viewpoint.enabled && par_.vehicle_type != "uav") {
+    const mighty::GridQuery gq = buildViewpointGridQuery();
+    const auto t0 = std::chrono::steady_clock::now();
+    mighty::ViewpointResult vp =
+        mighty::selectViewpoint(next->centroid_xy, next->geometry, robot_xy, gq, par_.expl_viewpoint);
+    const double vp_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    if (vp.ok) {
+      // Snapshot the PCA-aligned target strip's UNKNOWN cells for the post-dwell reveal.
+      obs_strip_snapshot_ =
+          mighty::snapshotTargetStripUnknown(next->centroid_xy, next->geometry, gq, par_.expl_viewpoint);
+      obs_ranked_      = vp.ranked;
+      obs_alt_idx_     = 0;
+      obs_frontier_id_ = next->id;
+      obs_q_           = vp.q;
+      obs_q_pre_       = vp.q_pre;
+      obs_yaw_         = vp.yaw;
+      obs_phase_       = ObsPhase::APPROACH_PRE;
+      issueViewpointGoal(obs_q_pre_, obs_yaw_);  // stage 1: drive to q_pre (final leg faces target)
+      RCLCPP_INFO(this->get_logger(),
+        "[expl_view] frontier=%lu C=(%.2f,%.2f) pca=%.2f n=(%.2f,%.2f) s=%.2f q*=(%.2f,%.2f) "
+        "q_pre=(%.2f,%.2f) yaw=%.0fdeg vis=%d/%d clr=%.2f strip=%zu alts=%zu (%.2f ms)",
+        static_cast<unsigned long>(next->id), next->centroid_xy.x(), next->centroid_xy.y(),
+        next->geometry.anisotropy, next->geometry.normal.x(), next->geometry.normal.y(),
+        vp.s, vp.q.x(), vp.q.y(), vp.q_pre.x(), vp.q_pre.y(), vp.yaw * 180.0 / M_PI,
+        vp.visible_samples, vp.total_samples, vp.clearance_m,
+        obs_strip_snapshot_.size(), obs_ranked_.size(), vp_ms);
+      issued_viewpoint = true;
+    } else if (!par_.expl_viewpoint.fallback_to_legacy_centroid) {
+      // No safe observation viewpoint: do NOT drive to the raw centroid (defeats the
+      // curb-safety purpose). Invalidate + cooldown; another frontier is picked next tick.
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[expl_view] frontier=%lu no viewpoint: %s (%.2f ms) — invalidate + cooldown",
+        static_cast<unsigned long>(next->id), mighty::viewpointRejectStr(vp.reason), vp_ms);
+      frontier_manager_->markInvalidated(next->id, this->now().seconds());
+      obs_phase_ = ObsPhase::IDLE;
+      return;
+    } else {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[expl_view] frontier=%lu no viewpoint: %s — falling back to legacy centroid",
+        static_cast<unsigned long>(next->id), mighty::viewpointRejectStr(vp.reason));
+    }
+  }
+
+  if (!issued_viewpoint) {
+    // Legacy centroid goal (viewpoint disabled, UAV, or explicit fallback).
+    geometry_msgs::msg::PoseStamped g;
+    g.header.frame_id    = par_.map_frame_id;
+    g.header.stamp       = this->now();
+    g.pose.position.x    = next->centroid_xy.x();
+    g.pose.position.y    = next->centroid_xy.y();
+    g.pose.position.z    = par_.expl_default_goal_z;
+    g.pose.orientation.w = 1.0;
+    terminalGoalCallbackImpl(g, /*from_user=*/false);
+    obs_phase_ = ObsPhase::IDLE;
+  }
 
   RCLCPP_INFO(this->get_logger(),
               "Exploration: -> frontier %lu at (%.2f, %.2f), state=%d, u=%.3f",
               static_cast<unsigned long>(next->id),
               next->centroid_xy.x(), next->centroid_xy.y(),
               static_cast<int>(next->state), next->cached_utility);
-
-  terminalGoalCallbackImpl(g, /*from_user=*/false);
 
   if (!exploration_start_captured_) {
     exploration_start_pos_ = Eigen::Vector3d(cur.pos.x(), cur.pos.y(), cur.pos.z());
