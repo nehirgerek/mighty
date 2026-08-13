@@ -319,16 +319,29 @@ class MIGHTY_NODE : public rclcpp::Node {
   //   R>=thresh: success (release to WFD) ; R<thresh: next alternate / invalidate.
   enum class ObsPhase { IDLE, APPROACH_PRE, APPROACH_Q, DWELL };
   ObsPhase obs_phase_ = ObsPhase::IDLE;
-  std::vector<mighty::ViewpointPose> obs_ranked_;    // ranked alternates for current frontier
-  size_t   obs_alt_idx_ = 0;
-  std::vector<Eigen::Vector2d> obs_strip_snapshot_;  // UNKNOWN strip cells snapshotted at selection
+  std::vector<double> obs_attempted_s_;              // lateral offsets already tried this episode
+  std::vector<Eigen::Vector2d> obs_strip_snapshot_;  // UNKNOWN strip cells snapshotted this attempt
   Eigen::Vector2d obs_q_{0.0, 0.0};
   Eigen::Vector2d obs_q_pre_{0.0, 0.0};
   double   obs_yaw_ = 0.0;
   double   obs_dwell_start_t_ = -1.0;
   uint64_t obs_frontier_id_ = 0;
+
+  /** @brief Outcome of a viewpoint attempt (initial select or post-reveal recompute). */
+  enum class ObsStart { STARTED, WAIT_TF, EMPTY_STRIP, NO_VIEWPOINT };
+
   /** @brief GridQuery over the current detection grid (+ESDF) for the viewpoint selector. */
   mighty::GridQuery buildViewpointGridQuery() const;
+  /** @brief base_link -> lidar extrinsic from tf2 (T_base_lidar). valid=false if the
+   *  transform is unavailable. Frames come from exploration.viewpoint.base_frame /
+   *  lidar_frame (empty => <ns>/base_link, <ns>/lidar). */
+  mighty::SensorExtrinsics buildSensorExtrinsics();
+  /** @brief Recompute viewpoints from the CURRENT map for frontier @p fid and start an
+   *  attempt (snapshot strip, issue q_pre, set override), skipping already-attempted s.
+   *  Records the attempt's s in obs_attempted_s_ and resets obs_strip_snapshot_. */
+  ObsStart beginViewpointAttempt(uint64_t fid, const Eigen::Vector2d& C,
+                                 const mighty::FrontierGeometry& geom,
+                                 const Eigen::Vector2d& robot_xy);
   /** @brief Issue an exploration terminal goal at (xy, yaw) via terminalGoalCallbackImpl. */
   void issueViewpointGoal(const Eigen::Vector2d& xy, double yaw);
   /** @brief Drive the viewpoint approach/dwell/reveal machine.

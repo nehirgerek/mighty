@@ -800,6 +800,9 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("exploration.viewpoint.min_reveal_fraction", 0.30);
   this->declare_parameter("exploration.viewpoint.strip_half_width_m", 0.75);
   this->declare_parameter("exploration.viewpoint.strip_depth_m", 0.0);
+  this->declare_parameter("exploration.viewpoint.base_frame", std::string(""));
+  this->declare_parameter("exploration.viewpoint.lidar_frame", std::string(""));
+  this->declare_parameter("exploration.viewpoint.require_sensor_tf", true);
   this->declare_parameter("exploration.visited_map.center_x", 0.0);
   this->declare_parameter("exploration.visited_map.center_y", 0.0);
   this->declare_parameter("exploration.visited_map.width_m", 100.0);
@@ -1198,6 +1201,10 @@ void MIGHTY_NODE::setParameters() {
     }
     par_.expl_view_observation_dwell_sec =
         this->get_parameter("exploration.viewpoint.observation_dwell_sec").as_double();
+    par_.expl_view_base_frame  = this->get_parameter("exploration.viewpoint.base_frame").as_string();
+    par_.expl_view_lidar_frame = this->get_parameter("exploration.viewpoint.lidar_frame").as_string();
+    par_.expl_view_require_sensor_tf =
+        this->get_parameter("exploration.viewpoint.require_sensor_tf").as_bool();
   }
   par_.expl_visited_map_center_x   = this->get_parameter("exploration.visited_map.center_x").as_double();
   par_.expl_visited_map_center_y   = this->get_parameter("exploration.visited_map.center_y").as_double();
@@ -1924,6 +1931,83 @@ mighty::GridQuery MIGHTY_NODE::buildViewpointGridQuery() const {
   return gq;
 }
 
+mighty::SensorExtrinsics MIGHTY_NODE::buildSensorExtrinsics() {
+  mighty::SensorExtrinsics e;
+  const std::string base =
+      par_.expl_view_base_frame.empty() ? (ns_ + "/base_link") : par_.expl_view_base_frame;
+  const std::string lidar =
+      par_.expl_view_lidar_frame.empty() ? (ns_ + "/lidar") : par_.expl_view_lidar_frame;
+  try {
+    // T_base_lidar: pose of the lidar expressed in base_link.
+    // lookupTransform(target=base, source=lidar) => transform mapping lidar-frame vectors
+    // into base_link, i.e. R_base_lidar. (Verified direction: base<-lidar.)
+    const geometry_msgs::msg::TransformStamped tf =
+        tf2_buffer_->lookupTransform(base, lidar, tf2::TimePointZero);
+    const auto& r = tf.transform.rotation;
+    const Eigen::Quaterniond quat(r.w, r.x, r.y, r.z);
+    e.R_base_lidar = quat.normalized().toRotationMatrix();
+    e.t_base_lidar = Eigen::Vector3d(tf.transform.translation.x, tf.transform.translation.y,
+                                     tf.transform.translation.z);
+    e.valid = true;
+  } catch (const std::exception& ex) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[expl_view] base->lidar TF (%s -> %s) unavailable: %s", base.c_str(), lidar.c_str(),
+      ex.what());
+    e.valid = false;
+  }
+  return e;
+}
+
+MIGHTY_NODE::ObsStart MIGHTY_NODE::beginViewpointAttempt(uint64_t fid, const Eigen::Vector2d& C,
+                                                        const mighty::FrontierGeometry& geom,
+                                                        const Eigen::Vector2d& robot_xy) {
+  // Actual sensor orientation from TF. If required but unavailable, wait (don't fall back
+  // to the scalar pitch, and don't invalidate — TF may just not have arrived yet).
+  const mighty::SensorExtrinsics extr = buildSensorExtrinsics();
+  if (par_.expl_view_require_sensor_tf && !extr.valid) return ObsStart::WAIT_TF;
+
+  // Recompute viewpoints from the CURRENT map (candidates from a previous attempt are
+  // stale after the map updated during the last observation).
+  const mighty::GridQuery gq = buildViewpointGridQuery();
+  const mighty::ViewpointResult vp =
+      mighty::selectViewpoint(C, geom, robot_xy, gq, par_.expl_viewpoint, extr);
+  if (!vp.ok) return ObsStart::NO_VIEWPOINT;
+
+  // Pick the best ranked pose whose lateral offset materially differs from every offset
+  // already tried this episode (so we don't re-attempt the same failed q*).
+  const double eps = 0.5 * par_.expl_viewpoint.lateral_step_m;
+  const mighty::ViewpointPose* chosen = nullptr;
+  for (const auto& pose : vp.ranked) {
+    bool tried = false;
+    for (double s : obs_attempted_s_)
+      if (std::abs(s - pose.s) <= eps) { tried = true; break; }
+    if (!tried) { chosen = &pose; break; }
+  }
+  if (chosen == nullptr) return ObsStart::NO_VIEWPOINT;  // every current candidate already tried
+
+  // Fresh strip snapshot for THIS attempt (own N_unknown_before).
+  obs_strip_snapshot_ = mighty::snapshotTargetStripUnknown(C, geom, gq, par_.expl_viewpoint);
+  if (obs_strip_snapshot_.empty()) return ObsStart::EMPTY_STRIP;
+
+  obs_frontier_id_ = fid;
+  obs_q_     = chosen->q;
+  obs_q_pre_ = chosen->q_pre;
+  obs_yaw_   = chosen->yaw;
+  obs_attempted_s_.push_back(chosen->s);
+  obs_phase_ = ObsPhase::APPROACH_PRE;
+  mighty_ptr_->setGoalRadiusOverride(par_.expl_viewpoint.arrival_tol_m);
+  RCLCPP_INFO(this->get_logger(),
+    "[expl_view] terminal radius override ON: %.2f m", par_.expl_viewpoint.arrival_tol_m);
+  issueViewpointGoal(obs_q_pre_, obs_yaw_);  // stage 1: drive to q_pre
+  RCLCPP_INFO(this->get_logger(),
+    "[expl_view] frontier=%lu attempt s=%.2f q*=(%.2f,%.2f) q_pre=(%.2f,%.2f) yaw=%.0fdeg "
+    "strip=%zu extr=%s",
+    static_cast<unsigned long>(fid), chosen->s, obs_q_.x(), obs_q_.y(), obs_q_pre_.x(),
+    obs_q_pre_.y(), obs_yaw_ * 180.0 / M_PI, obs_strip_snapshot_.size(),
+    extr.valid ? "tf" : "fallback");
+  return ObsStart::STARTED;
+}
+
 void MIGHTY_NODE::issueViewpointGoal(const Eigen::Vector2d& xy, double yaw) {
   geometry_msgs::msg::PoseStamped g;
   g.header.frame_id    = par_.map_frame_id;
@@ -1967,7 +2051,11 @@ bool MIGHTY_NODE::tickViewpointObservation() {
   if (obs_phase_ == ObsPhase::APPROACH_Q) {
     const double d = (p - obs_q_).norm();
     if (d <= tol) {
-      RCLCPP_INFO(this->get_logger(), "[expl_view] reached q*: d=%.3f m (<= %.2f)", d, tol);
+      // Observation-heading audit (field evidence on path-derived heading; NOT gated yet).
+      const double yaw_err = std::atan2(std::sin(obs_yaw_ - cur.yaw), std::cos(obs_yaw_ - cur.yaw));
+      RCLCPP_INFO(this->get_logger(),
+        "[expl_view] reached q*: d=%.3f m desired_yaw=%.1fdeg actual_yaw=%.1fdeg yaw_err=%.1fdeg",
+        d, obs_yaw_ * 180.0 / M_PI, cur.yaw * 180.0 / M_PI, yaw_err * 180.0 / M_PI);
       obs_dwell_start_t_ = this->now().seconds();
       obs_phase_ = ObsPhase::DWELL;
     }
@@ -1989,24 +2077,33 @@ bool MIGHTY_NODE::tickViewpointObservation() {
     exploration_active_ = false;
     return true;
   }
-  // R below threshold -> try the next ranked alternate viewpoint (override stays active).
-  ++obs_alt_idx_;
-  if (obs_alt_idx_ < obs_ranked_.size()) {
-    const auto& vp = obs_ranked_[obs_alt_idx_];
-    obs_q_ = vp.q; obs_q_pre_ = vp.q_pre; obs_yaw_ = vp.yaw;
+  // R below threshold -> RECOMPUTE viewpoints from the CURRENT map (the previous
+  // candidates were computed before this observation and may now be stale), skipping the
+  // s values already attempted. If the frontier is gone / no longer active, release it.
+  RCLCPP_INFO(this->get_logger(),
+    "[expl_view] frontier=%lu R=%.2f<%.2f — recomputing viewpoints from current map",
+    static_cast<unsigned long>(obs_frontier_id_), R, par_.expl_viewpoint.min_reveal_fraction);
+  const FrontierRecord* rec = frontier_manager_ ? frontier_manager_->find(obs_frontier_id_) : nullptr;
+  if (rec == nullptr ||
+      (rec->state != FrontierState::ACTIVE && rec->state != FrontierState::DORMANT)) {
     RCLCPP_INFO(this->get_logger(),
-      "[expl_view] frontier=%lu R=%.2f<%.2f — trying alternate %zu/%zu",
-      static_cast<unsigned long>(obs_frontier_id_), R, par_.expl_viewpoint.min_reveal_fraction,
-      obs_alt_idx_ + 1, obs_ranked_.size());
-    issueViewpointGoal(obs_q_pre_, obs_yaw_);
-    obs_phase_ = ObsPhase::APPROACH_PRE;
+      "[expl_view] frontier=%lu no longer active — releasing to WFD",
+      static_cast<unsigned long>(obs_frontier_id_));
+    endViewpointObservation();
+    exploration_active_ = false;
     return true;
   }
-  // Alternates exhausted -> invalidate + cooldown; another frontier gets picked.
+  state cur2;
+  mighty_ptr_->getState(cur2);
+  const ObsStart r2 = beginViewpointAttempt(obs_frontier_id_, rec->centroid_xy, rec->geometry,
+                                            Eigen::Vector2d(cur2.pos.x(), cur2.pos.y()));
+  if (r2 == ObsStart::STARTED) return true;  // next attempt underway (override stays active)
+  // No further usable viewpoint (empty strip / none new / TF lost) -> invalidate + cooldown.
   RCLCPP_INFO(this->get_logger(),
-    "[expl_view] frontier=%lu R=%.2f, all %zu viewpoints exhausted — INVALIDATE + cooldown",
-    static_cast<unsigned long>(obs_frontier_id_), R, obs_ranked_.size());
-  if (frontier_manager_) frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
+    "[expl_view] frontier=%lu recompute -> %s, exhausted — INVALIDATE + cooldown",
+    static_cast<unsigned long>(obs_frontier_id_),
+    r2 == ObsStart::EMPTY_STRIP ? "empty_strip" : (r2 == ObsStart::WAIT_TF ? "tf_lost" : "no_viewpoint"));
+  frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
   endViewpointObservation();
   exploration_active_ = false;
   return true;
@@ -3665,52 +3762,41 @@ void MIGHTY_NODE::exploreSelectCallback() {
   // Perception-aware viewpoint: pick a safe standoff pose that can observe behind the
   // frontier (curb/step safety) instead of driving onto the FREE/UNKNOWN boundary.
   if (par_.expl_viewpoint.enabled && par_.vehicle_type != "uav") {
-    const mighty::GridQuery gq = buildViewpointGridQuery();
+    obs_attempted_s_.clear();  // fresh observation episode for this frontier
     const auto t0 = std::chrono::steady_clock::now();
-    mighty::ViewpointResult vp =
-        mighty::selectViewpoint(next->centroid_xy, next->geometry, robot_xy, gq, par_.expl_viewpoint);
+    const ObsStart r = beginViewpointAttempt(next->id, next->centroid_xy, next->geometry, robot_xy);
     const double vp_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-
-    if (vp.ok) {
-      // Snapshot the PCA-aligned target strip's UNKNOWN cells for the post-dwell reveal.
-      obs_strip_snapshot_ =
-          mighty::snapshotTargetStripUnknown(next->centroid_xy, next->geometry, gq, par_.expl_viewpoint);
-      obs_ranked_      = vp.ranked;
-      obs_alt_idx_     = 0;
-      obs_frontier_id_ = next->id;
-      obs_q_           = vp.q;
-      obs_q_pre_       = vp.q_pre;
-      obs_yaw_         = vp.yaw;
-      obs_phase_       = ObsPhase::APPROACH_PRE;
-      // Core MIGHTY must drive to the tight viewpoint tolerance for BOTH q_pre and q*,
-      // not stop at the generic goal_radius. Scoped override, cleared on every exit.
-      mighty_ptr_->setGoalRadiusOverride(par_.expl_viewpoint.arrival_tol_m);
-      RCLCPP_INFO(this->get_logger(), "[expl_view] terminal radius override ON: %.2f m",
-                  par_.expl_viewpoint.arrival_tol_m);
-      issueViewpointGoal(obs_q_pre_, obs_yaw_);  // stage 1: drive to q_pre (final leg faces target)
-      RCLCPP_INFO(this->get_logger(),
-        "[expl_view] frontier=%lu C=(%.2f,%.2f) pca=%.2f n=(%.2f,%.2f) s=%.2f q*=(%.2f,%.2f) "
-        "q_pre=(%.2f,%.2f) yaw=%.0fdeg vis=%d/%d clr=%.2f strip=%zu alts=%zu (%.2f ms)",
-        static_cast<unsigned long>(next->id), next->centroid_xy.x(), next->centroid_xy.y(),
-        next->geometry.anisotropy, next->geometry.normal.x(), next->geometry.normal.y(),
-        vp.s, vp.q.x(), vp.q.y(), vp.q_pre.x(), vp.q_pre.y(), vp.yaw * 180.0 / M_PI,
-        vp.visible_samples, vp.total_samples, vp.clearance_m,
-        obs_strip_snapshot_.size(), obs_ranked_.size(), vp_ms);
-      issued_viewpoint = true;
-    } else if (!par_.expl_viewpoint.fallback_to_legacy_centroid) {
-      // No safe observation viewpoint: do NOT drive to the raw centroid (defeats the
-      // curb-safety purpose). Invalidate + cooldown; another frontier is picked next tick.
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[expl_view] frontier=%lu no viewpoint: %s (%.2f ms) — invalidate + cooldown",
-        static_cast<unsigned long>(next->id), mighty::viewpointRejectStr(vp.reason), vp_ms);
-      frontier_manager_->markInvalidated(next->id, this->now().seconds());
-      endViewpointObservation();  // clears any override, sets IDLE
-      return;
-    } else {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[expl_view] frontier=%lu no viewpoint: %s — falling back to legacy centroid",
-        static_cast<unsigned long>(next->id), mighty::viewpointRejectStr(vp.reason));
+    switch (r) {
+      case ObsStart::STARTED:
+        issued_viewpoint = true;
+        break;
+      case ObsStart::WAIT_TF:
+        // TF not ready: do NOT invalidate and do NOT issue a goal — retry next tick.
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[expl_view] frontier=%lu waiting for base->lidar TF before issuing viewpoint",
+          static_cast<unsigned long>(next->id));
+        return;
+      case ObsStart::EMPTY_STRIP:
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[expl_view] frontier=%lu EMPTY_TARGET_STRIP (no UNKNOWN behind frontier, %.2f ms) "
+          "— invalidate + cooldown", static_cast<unsigned long>(next->id), vp_ms);
+        frontier_manager_->markInvalidated(next->id, this->now().seconds());
+        endViewpointObservation();
+        return;
+      case ObsStart::NO_VIEWPOINT:
+        if (par_.expl_viewpoint.fallback_to_legacy_centroid) {
+          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "[expl_view] frontier=%lu no viewpoint — falling back to legacy centroid",
+            static_cast<unsigned long>(next->id));
+          break;  // issued_viewpoint stays false -> legacy centroid below
+        }
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[expl_view] frontier=%lu no safe viewpoint (%.2f ms) — invalidate + cooldown",
+          static_cast<unsigned long>(next->id), vp_ms);
+        frontier_manager_->markInvalidated(next->id, this->now().seconds());
+        endViewpointObservation();
+        return;
     }
   }
 

@@ -79,6 +79,17 @@ struct GridQuery {
   std::function<double(double, double)> esdfDistance;  // optional (only if in bounds)
 };
 
+/** @brief base_link -> lidar extrinsic (ROS-free). The node fills this from tf2 and
+ *  passes it in; the geometry core never touches ROS. When @c valid is false the
+ *  visibility model falls back to the scalar sensor_mount_pitch_deg. Only the rotation
+ *  is used for the vertical-FOV ray; translation is carried for completeness (the
+ *  curb-lip test uses sensor_height_m, see targetPotentiallyVisible). */
+struct SensorExtrinsics {
+  bool valid = false;
+  Eigen::Matrix3d R_base_lidar = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d t_base_lidar = Eigen::Vector3d::Zero();
+};
+
 // ---------------------------------------------------------------------------
 // PCA geometry of one frontier
 // ---------------------------------------------------------------------------
@@ -150,7 +161,8 @@ FrontierGeometry computeFrontierGeometry(const std::vector<Eigen::Vector2d>& cel
  *  Deterministic: minimize |s|; +s/-s tie -> closer to robot -> greater clearance. */
 ViewpointResult selectViewpoint(const Eigen::Vector2d& centroid, const FrontierGeometry& geom,
                                 const Eigen::Vector2d& robot_xy, const GridQuery& grid,
-                                const ViewpointParams& P);
+                                const ViewpointParams& P,
+                                const SensorExtrinsics& extr = SensorExtrinsics{});
 
 // ---- Exposed helpers (unit-tested directly) --------------------------------
 
@@ -166,13 +178,17 @@ bool segmentFootprintSafe(const Eigen::Vector2d& a, const Eigen::Vector2d& b,
                           const GridQuery& grid, const ViewpointParams& P);
 
 /** @brief Potential visibility of a single hypothetical target g behind the frontier,
- *  from viewpoint q (sensor faces the frontier). Combines the curb-lip clearance
- *  (x >= H*d/h) with the Mid-360 vertical-FOV depression window and (optional) 2-D
- *  occupancy occlusion along q->frontier. @p depth is the along-normal distance of g
- *  behind the frontier; @p standoff is the perpendicular d. */
+ *  from viewpoint q (sensor faces the frontier along @p psi_obs). Combines the curb-lip
+ *  clearance (x >= H*d/h) with the vertical-FOV window and (optional) 2-D OCCUPIED
+ *  occlusion along q->frontier. The vertical-FOV ray is rotated into the LiDAR frame
+ *  using the actual base->lidar extrinsic (@p extr) composed with the rover yaw psi_obs;
+ *  if @p extr.valid is false it falls back to the scalar sensor_mount_pitch_deg (which
+ *  reproduces the old p - delta result). @p depth = along-normal distance of g behind
+ *  the frontier; @p standoff = perpendicular d. */
 bool targetPotentiallyVisible(const Eigen::Vector2d& q, const Eigen::Vector2d& g,
                               double depth, double standoff, const GridQuery& grid,
-                              const ViewpointParams& P);
+                              const ViewpointParams& P, double psi_obs = 0.0,
+                              const SensorExtrinsics& extr = SensorExtrinsics{});
 
 /** @brief Snapshot the world centers of all UNKNOWN cells inside a PCA-aligned strip
  *  behind the frontier: along +normal over [0, strip_depth] and along +/-tangent over
@@ -184,7 +200,10 @@ std::vector<Eigen::Vector2d> snapshotTargetStripUnknown(const Eigen::Vector2d& c
                                                         const ViewpointParams& P);
 
 /** @brief Reveal fraction R = 1 - N_unknown_after/N_unknown_before over the snapshotted
- *  cells (how many stopped being UNKNOWN). Returns 1.0 if the snapshot was empty. */
+ *  cells (how many stopped being UNKNOWN). Returns 0.0 for an EMPTY snapshot: an empty
+ *  target strip carries no observation evidence, so it must NOT count as a successful
+ *  reveal (the caller should treat empty as EMPTY_TARGET_STRIP and release the frontier,
+ *  never as success). */
 double revealFraction(const std::vector<Eigen::Vector2d>& snapshot_unknown, const GridQuery& grid);
 
 }  // namespace mighty

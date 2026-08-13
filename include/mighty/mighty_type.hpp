@@ -361,6 +361,12 @@ struct parameters {
   // exploration.viewpoint.* params in setParameters(); robot_bbox_x/y come from drone_bbox.
   mighty::ViewpointParams expl_viewpoint;
   double expl_view_observation_dwell_sec{0.5};  // dwell at the viewpoint before VISITED
+  // base_link -> lidar TF frames for the viewpoint FOV model. Empty => <ns>/base_link,
+  // <ns>/lidar. require_sensor_tf: if true, skip (not invalidate) viewpoint issuance
+  // until the transform is available instead of falling back to the scalar pitch.
+  std::string expl_view_base_frame{};
+  std::string expl_view_lidar_frame{};
+  bool        expl_view_require_sensor_tf{true};
   // Invalidation keep-out — drop fresh clusters that fall within radius_m of
   // any INVALIDATED record whose invalidation is still inside the cooldown
   // window. Set radius_m <= 0 to disable; cooldown_sec <= 0 = permanent.

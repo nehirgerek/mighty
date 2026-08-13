@@ -297,6 +297,68 @@ TEST(FrontierViewpoint, RankedAlternatesProvided) {
   EXPECT_GE(std::abs(r.ranked[1].s), std::abs(r.ranked[0].s) - 1e-9);   // then larger |s|
 }
 
+// TEST 17 -- a TF extrinsic of Ry(20deg) reproduces the scalar sensor_mount_pitch_deg=20
+// FOV classification exactly (the TF path and the fallback agree).
+TEST(FrontierViewpoint, TfExtrinsicMatchesScalarPitch) {
+  GridQuery grid = halfPlaneGrid([](double, double) { return false; });
+  ViewpointParams P = baseParams();
+  P.sensor_mount_pitch_deg = 20.0;  // scalar fallback
+  SensorExtrinsics extr;
+  extr.valid = true;
+  extr.R_base_lidar = Eigen::AngleAxisd(20.0 * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+
+  const Eigen::Vector2d q(0.0, 0.0);
+  for (double horiz : {0.5, 0.9, 1.2, 1.3, 1.5, 2.0, 3.0}) {
+    const Eigen::Vector2d g(horiz, 0.0);
+    const bool scalar = targetPotentiallyVisible(q, g, 0.5, 0.75, grid, P);            // fallback (invalid extr)
+    const bool tf     = targetPotentiallyVisible(q, g, 0.5, 0.75, grid, P, 0.0, extr); // TF Ry(20)
+    EXPECT_EQ(scalar, tf) << "horiz=" << horiz;
+  }
+}
+
+// TEST 18 -- FOV classification responds to the sensor extrinsic orientation.
+TEST(FrontierViewpoint, FovRespondsToOrientation) {
+  GridQuery grid = halfPlaneGrid([](double, double) { return false; });
+  ViewpointParams P = baseParams();
+  const Eigen::Vector2d q(0.0, 0.0), g(2.0, 0.0);  // 2 m out -> ~18 deg depression
+  SensorExtrinsics flat;    flat.valid = true;     flat.R_base_lidar = Eigen::Matrix3d::Identity();
+  SensorExtrinsics steep;   steep.valid = true;
+  steep.R_base_lidar = Eigen::AngleAxisd(40.0 * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  // Flat sensor: target is below the -7deg lower bound -> not visible.
+  EXPECT_FALSE(targetPotentiallyVisible(q, g, 0.5, 0.75, grid, P, 0.0, flat));
+  // Pitched 40deg down: the same target rises into the vertical FOV -> visible.
+  EXPECT_TRUE(targetPotentiallyVisible(q, g, 0.5, 0.75, grid, P, 0.0, steep));
+}
+
+// TEST 19 -- an empty target strip yields reveal 0.0 (never a successful observation).
+TEST(FrontierViewpoint, EmptyStripRevealIsZero) {
+  GridQuery all_free = halfPlaneGrid([](double, double) { return false; });  // nothing unknown
+  std::vector<Eigen::Vector2d> cells;
+  for (double x = -1.0; x <= 1.0 + 1e-9; x += 0.15) cells.emplace_back(x, 0.0);
+  ViewpointParams P = baseParams();
+  P.strip_depth_m = 0.70;
+  FrontierGeometry g = computeFrontierGeometry(cells, all_free, P);
+  ASSERT_TRUE(g.valid);
+  auto snap = snapshotTargetStripUnknown(Eigen::Vector2d(0.0, 0.0), g, all_free, P);
+  EXPECT_TRUE(snap.empty());
+  EXPECT_DOUBLE_EQ(revealFraction(snap, all_free), 0.0);  // empty != fully revealed
+  EXPECT_DOUBLE_EQ(revealFraction({}, all_free), 0.0);
+}
+
+// TEST 20 -- reveal threshold: R=0.29 fails, R=0.30 succeeds (min_reveal_fraction=0.30).
+TEST(FrontierViewpoint, RevealThreshold) {
+  std::vector<Eigen::Vector2d> snap;
+  for (int i = 0; i < 100; ++i) snap.emplace_back(static_cast<double>(i), 0.0);
+  int revealed = 0;
+  GridQuery grid;
+  grid.isUnknown = [&revealed](double x, double) { return x >= static_cast<double>(revealed); };
+  const double thresh = 0.30;
+  revealed = 29;  // 71 still unknown -> R = 0.29
+  EXPECT_LT(revealFraction(snap, grid), thresh);
+  revealed = 30;  // 70 still unknown -> R = 0.30
+  EXPECT_GE(revealFraction(snap, grid), thresh);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

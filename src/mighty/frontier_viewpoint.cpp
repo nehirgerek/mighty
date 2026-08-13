@@ -160,7 +160,8 @@ bool segmentFootprintSafe(const Eigen::Vector2d& a, const Eigen::Vector2d& b, co
 // Single-target potential visibility (Mid-360 FOV + curb-lip + 2-D occlusion)
 // ===========================================================================
 bool targetPotentiallyVisible(const Eigen::Vector2d& q, const Eigen::Vector2d& g, double depth,
-                              double standoff, const GridQuery& grid, const ViewpointParams& P) {
+                              double standoff, const GridQuery& grid, const ViewpointParams& P,
+                              double psi_obs, const SensorExtrinsics& extr) {
   const double h = P.sensor_height_m;
   const double H = P.critical_drop_m;
   const double d = standoff;
@@ -170,18 +171,24 @@ bool targetPotentiallyVisible(const Eigen::Vector2d& q, const Eigen::Vector2d& g
   // until x >= H*d/h. The lateral offset does not remove straight-lip occlusion.
   if (h > 1e-6 && depth < (H * d / h)) return false;
 
-  // (b) Mid-360 vertical-FOV depression window. Sensor faces the target; horizontal
-  // range is the true (possibly diagonal) distance, vertical drop is h + H (target on
-  // lower ground). Depression delta is positive downward. A nose-down mount pitch p
-  // maps a world ray of elevation e to sensor elevation (e + p); here e = -delta, so
-  // the sensor elevation is (p - delta) and must lie within the native [vmin, vmax].
-  const double horiz = (g - q).norm();
-  const double delta = std::atan2(h + H, std::max(horiz, 1e-6));  // downward, +
-  const double p = P.sensor_mount_pitch_deg * kDeg2Rad;
-  const double sensor_elev = p - delta;
+  // (b) Vertical-FOV window using the ACTUAL base->lidar orientation. The map-frame ray
+  // from the sensor to the (lower-ground) target is the horizontal (g - q) with vertical
+  // drop -(h + H); rotate it into the LiDAR frame via Rz(psi_obs) * R_base_lidar and
+  // take its elevation. When extr is valid this is TF-driven; otherwise it falls back to
+  // the scalar sensor_mount_pitch_deg about +Y (which reproduces the old p - delta).
+  const Eigen::Vector2d dir = g - q;
+  const Eigen::Vector3d ray_map(dir.x(), dir.y(), -(h + H));
+  const Eigen::Matrix3d R_base_lidar =
+      extr.valid ? extr.R_base_lidar
+                 : Eigen::Matrix3d(Eigen::AngleAxisd(P.sensor_mount_pitch_deg * kDeg2Rad,
+                                                     Eigen::Vector3d::UnitY()));
+  const Eigen::Matrix3d R_map_lidar =
+      Eigen::Matrix3d(Eigen::AngleAxisd(psi_obs, Eigen::Vector3d::UnitZ())) * R_base_lidar;
+  const Eigen::Vector3d p_lidar = R_map_lidar.transpose() * ray_map;  // map->lidar
+  const double elev = std::atan2(p_lidar.z(), std::hypot(p_lidar.x(), p_lidar.y()));
   const double vmin = P.sensor_vertical_min_deg * kDeg2Rad;
   const double vmax = P.sensor_vertical_max_deg * kDeg2Rad;
-  if (sensor_elev < vmin || sensor_elev > vmax) return false;
+  if (elev < vmin || elev > vmax) return false;
 
   // (c) Cheap 2-D occlusion: reject if a known-OCCUPIED cell blocks the segment q->g.
   if (grid.isOccupied) {
@@ -238,7 +245,9 @@ std::vector<Eigen::Vector2d> snapshotTargetStripUnknown(const Eigen::Vector2d& c
 }
 
 double revealFraction(const std::vector<Eigen::Vector2d>& snapshot_unknown, const GridQuery& grid) {
-  if (snapshot_unknown.empty()) return 1.0;   // nothing was unknown -> treat as fully revealed
+  // An empty target strip carries NO observation evidence -> not a successful reveal.
+  // The caller detects empty separately (EMPTY_TARGET_STRIP) and releases the frontier.
+  if (snapshot_unknown.empty()) return 0.0;
   if (!grid.isUnknown) return 0.0;
   int still = 0;
   for (const auto& c : snapshot_unknown)
@@ -255,11 +264,13 @@ namespace {
 // unknown point used for the approach heading (hat(target - q)).
 ViewpointReject evalCandidate(double s, const Eigen::Vector2d& C, const FrontierGeometry& geom,
                               const Eigen::Vector2d& target, const GridQuery& grid,
-                              const ViewpointParams& P, Eigen::Vector2d& q_out,
-                              Eigen::Vector2d& q_pre_out, int& vis_out, int& tot_out,
-                              double& clear_out, std::vector<Eigen::Vector2d>& samples_out) {
+                              const ViewpointParams& P, const SensorExtrinsics& extr,
+                              Eigen::Vector2d& q_out, Eigen::Vector2d& q_pre_out, int& vis_out,
+                              int& tot_out, double& clear_out,
+                              std::vector<Eigen::Vector2d>& samples_out) {
   const Eigen::Vector2d q = C - P.standoff_m * geom.normal + s * geom.tangent;
   q_out = q;
+  const double psi_obs = std::atan2(target.y() - q.y(), target.x() - q.x());  // rover faces target
   q_pre_out = q;
   vis_out = 0;
   tot_out = static_cast<int>(P.target_depths_m.size());
@@ -277,7 +288,7 @@ ViewpointReject evalCandidate(double s, const Eigen::Vector2d& C, const Frontier
 
   for (double depth : P.target_depths_m) {
     const Eigen::Vector2d g = C + depth * geom.normal;
-    if (targetPotentiallyVisible(q, g, depth, P.standoff_m, grid, P)) {
+    if (targetPotentiallyVisible(q, g, depth, P.standoff_m, grid, P, psi_obs, extr)) {
       ++vis_out;
       samples_out.push_back(g);
     }
@@ -301,7 +312,7 @@ ViewpointReject evalCandidate(double s, const Eigen::Vector2d& C, const Frontier
 
 ViewpointResult selectViewpoint(const Eigen::Vector2d& centroid, const FrontierGeometry& geom,
                                 const Eigen::Vector2d& robot_xy, const GridQuery& grid,
-                                const ViewpointParams& P) {
+                                const ViewpointParams& P, const SensorExtrinsics& extr) {
   ViewpointResult res;
   res.geom = geom;
   if (!geom.valid) {
@@ -346,8 +357,8 @@ ViewpointResult selectViewpoint(const Eigen::Vector2d& centroid, const FrontierG
       int vis, tot;
       double clr;
       std::vector<Eigen::Vector2d> samples;
-      const ViewpointReject r =
-          evalCandidate(offs[i], centroid, geom, target, grid, P, q, q_pre, vis, tot, clr, samples);
+      const ViewpointReject r = evalCandidate(offs[i], centroid, geom, target, grid, P, extr, q,
+                                              q_pre, vis, tot, clr, samples);
       res.candidates.emplace_back(offs[i], r == ViewpointReject::NONE, r);
       if (r != ViewpointReject::NONE) {
         if (res.reason == ViewpointReject::NO_CANDIDATE) res.reason = r;  // first failure reason
