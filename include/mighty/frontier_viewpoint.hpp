@@ -59,6 +59,20 @@ struct ViewpointParams {
   double min_reveal_fraction     = 0.30;
   double strip_half_width_m      = 0.75;   // lateral (tangent) half-extent of the strip
   double strip_depth_m           = 0.0;    // along-normal depth; <=0 => max(target_depths_m)
+
+  // --- Local q_vis visibility maneuver (v3 default; distance-from-frontier is an OUTPUT
+  // of visibility sampling, NOT a fixed standoff). use_local_qvis=false keeps the legacy
+  // fixed-standoff selectViewpoint() for regression/debug. ---
+  bool   use_local_qvis          = true;
+  double search_radius_m         = 2.5;    // local q_vis sampling disk around the centroid
+  double position_step_m         = 0.25;
+  int    max_candidate_positions = 500;
+  double critical_frontier_half_width_m = 0.45;  // tangent band selecting the relevant U_first
+  std::vector<double> heading_offsets_deg = {-30.0, -15.0, 0.0, 15.0, 30.0};
+  int    blind_mask_azimuth_bins = 360;
+  double blind_margin_m          = 0.25;   // required rho - r_blind(theta) margin
+  double min_first_unknown_visible_fraction = 1.0;  // V_first gate (generic, H=0; NOT the lip)
+  int    max_qvis_plan_attempts  = 5;      // Step 9: max HGP-route-validated candidates per episode
   // Footprint radius from the configured XY bounding box: r = 0.5*sqrt(bx^2+by^2).
   double robot_bbox_x            = 0.6;
   double robot_bbox_y            = 0.6;
@@ -109,6 +123,7 @@ enum class ViewpointReject {
   LOW_CLEARANCE,
   LOW_VISIBILITY,
   APPROACH_UNSAFE,   // q_pre -> q* terminal segment not footprint/ESDF safe
+  NO_TARGETS,        // no first-UNKNOWN cells in the critical band (local q_vis mode)
   NO_CANDIDATE,
 };
 const char* viewpointRejectStr(ViewpointReject r);
@@ -177,6 +192,16 @@ ViewpointReject footprintCheck(const Eigen::Vector2d& q, const GridQuery& grid,
 bool segmentFootprintSafe(const Eigen::Vector2d& a, const Eigen::Vector2d& b,
                           const GridQuery& grid, const ViewpointParams& P);
 
+/** @brief Step-9 pre-observation route check. Validates a full multi-vertex path
+ *  (robot -> ... -> q_pre) for the rover footprint: interpolates each segment at
+ *  <= grid resolution and runs footprintCheck at every sample. Explicit known-FREE
+ *  semantics: FREE -> allowed; UNKNOWN / OOB -> FOOTPRINT_UNKNOWN; OCCUPIED ->
+ *  FOOTPRINT_OCCUPIED (dominant). Returns NONE only if EVERY sampled footprint disc is
+ *  known FREE, so the robot cannot reach q_pre by cutting through unobserved space.
+ *  Occupancy-only (does NOT apply the ESDF margin -- that gates q_vis/q_pre, not route). */
+ViewpointReject pathFootprintKnownFree(const std::vector<Eigen::Vector2d>& path,
+                                       const GridQuery& grid, const ViewpointParams& P);
+
 /** @brief Potential visibility of a single hypothetical target g behind the frontier,
  *  from viewpoint q (sensor faces the frontier along @p psi_obs). Combines the curb-lip
  *  clearance (x >= H*d/h) with the vertical-FOV window and (optional) 2-D OCCUPIED
@@ -205,5 +230,53 @@ std::vector<Eigen::Vector2d> snapshotTargetStripUnknown(const Eigen::Vector2d& c
  *  reveal (the caller should treat empty as EMPTY_TARGET_STRIP and release the frontier,
  *  never as success). */
 double revealFraction(const std::vector<Eigen::Vector2d>& snapshot_unknown, const GridQuery& grid);
+
+// ---------------------------------------------------------------------------
+// v3: near-ground blind mask + local q_vis visibility maneuver
+// ---------------------------------------------------------------------------
+
+/** @brief Cached rover-frame near-ground blind boundary r_blind(theta): the nearest
+ *  nominal-flat-ground horizontal range the LiDAR can see at base-frame azimuth theta,
+ *  given the base->lidar rotation, sensor height, and vertical FOV. This is a PERCEPTION
+ *  boundary (sensor height/tilt/FOV), not the physical footprint. Built once when the
+ *  extrinsics/config change. */
+class BlindMask {
+ public:
+  BlindMask() = default;
+  /** @param R_base_lidar base<-lidar rotation (identity-safe fallback = Ry(pitch)).
+   *  @param h            sensor height above nominal ground [m].
+   *  @param n_bins       azimuth bins (e.g. 360).
+   *  @param e_lo_deg,e_hi_deg  native vertical FOV bounds. */
+  static BlindMask build(const Eigen::Matrix3d& R_base_lidar, double h, int n_bins,
+                         double e_lo_deg, double e_hi_deg);
+  /** @return nearest visible flat-ground range at rover-frame azimuth theta [rad];
+   *  +inf if no downward ray reaches the ground in that bin. */
+  double rBlind(double theta) const;
+  int bins() const { return n_; }
+  bool valid() const { return n_ > 0; }
+
+ private:
+  int n_ = 0;
+  std::vector<double> r_;  // per-bin min horizontal range (+inf if never hit)
+};
+
+/** @brief The actual first-UNKNOWN occupancy cells adjacent to the FREE frontier, within
+ *  the critical tangent band |(u-C).t| <= critical_frontier_half_width_m and on the +n
+ *  (UNKNOWN) side. Bounded local scan of the current grid; no synthetic points. */
+std::vector<Eigen::Vector2d> computeFirstUnknownTargets(const Eigen::Vector2d& C,
+                                                        const FrontierGeometry& geom,
+                                                        const GridQuery& grid,
+                                                        const ViewpointParams& P);
+
+/** @brief v3 selector: sample local known-FREE q_vis + a few headings, accept the
+ *  earliest/low-detour pose from which the first-UNKNOWN cells clear the near-ground
+ *  blind mask (by blind_margin_m) and are unoccluded, then derive q_pre for the arrival
+ *  heading. No fixed standoff. @p attempted q_vis positions are skipped (recompute).
+ *  Returns ViewpointResult{ ok, q(=q_vis), q_pre, yaw, ... } or a reject reason. */
+ViewpointResult selectViewpointLocal(const Eigen::Vector2d& C, const FrontierGeometry& geom,
+                                     const Eigen::Vector2d& robot_xy, const GridQuery& grid,
+                                     const ViewpointParams& P, const BlindMask& mask,
+                                     const std::vector<Eigen::Vector2d>& U_first,
+                                     const std::vector<Eigen::Vector2d>& attempted = {});
 
 }  // namespace mighty

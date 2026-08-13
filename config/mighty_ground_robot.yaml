@@ -402,6 +402,17 @@ mighty_node:
         exploration.viewpoint.base_frame: ""                     # [-] base frame for the sensor FOV TF; "" => <ns>/base_link
         exploration.viewpoint.lidar_frame: ""                    # [-] lidar frame for the sensor FOV TF; "" => <ns>/lidar
         exploration.viewpoint.require_sensor_tf: true            # [-] if true, wait for base->lidar TF (do not fall back to scalar pitch)
+        # v3 local q_vis visibility maneuver (distance-from-frontier is an OUTPUT of sampling, not a fixed standoff)
+        exploration.viewpoint.use_local_qvis: true               # [-] true: local free-space q_vis search; false: legacy fixed-standoff
+        exploration.viewpoint.search_radius_m: 2.5               # [m] local q_vis sampling disk radius around the frontier centroid
+        exploration.viewpoint.position_step_m: 0.25             # [m] q_vis sampling step
+        exploration.viewpoint.max_candidate_positions: 500       # [-] cap on sampled q_vis positions
+        exploration.viewpoint.critical_frontier_half_width_m: 0.45  # [m] tangent half-band selecting the relevant first-UNKNOWN cells
+        exploration.viewpoint.heading_offsets_deg: [-30.0, -15.0, 0.0, 15.0, 30.0]  # [deg] local observation-heading samples about the look direction
+        exploration.viewpoint.blind_mask_azimuth_bins: 360       # [-] azimuth bins for the cached near-ground blind mask
+        exploration.viewpoint.blind_margin_m: 0.25               # [m] required rho - r_blind(theta) margin for a target to count as visible
+        exploration.viewpoint.min_first_unknown_visible_fraction: 1.0  # [-] fraction of first-UNKNOWN cells that must be visible
+        exploration.viewpoint.max_qvis_plan_attempts: 5           # [-] Step 9: max HGP-route-validated q_vis candidates per episode
         exploration.visited_map.center_x: 0.0                    # [m]   bitmap center x (world frame)
         exploration.visited_map.center_y: 0.0                    # [m]   bitmap center y (world frame)
         exploration.visited_map.width_m: 100.0                   # [m]   total extent (must cover full mission area)

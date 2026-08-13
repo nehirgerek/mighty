@@ -359,6 +359,182 @@ TEST(FrontierViewpoint, RevealThreshold) {
   EXPECT_GE(revealFraction(snap, grid), thresh);
 }
 
+// ---- v3: blind mask + local q_vis selector -------------------------------
+namespace {
+Eigen::Matrix3d Rpitch(double deg) {
+  return Eigen::AngleAxisd(deg * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+}
+// Frontier along x=0 (tangent ~y), UNKNOWN at x>0; optional occupied band.
+GridQuery frontierGrid(std::function<bool(double, double)> occ = nullptr) {
+  return halfPlaneGrid([](double x, double) { return x > 0.0; }, occ);
+}
+std::vector<Eigen::Vector2d> frontierCells() {
+  std::vector<Eigen::Vector2d> c;
+  for (double y = -0.6; y <= 0.6 + 1e-9; y += 0.15) c.emplace_back(0.0, y);
+  return c;
+}
+}  // namespace
+
+// TEST 21 -- blind mask: 20deg pitch gives a plausible forward near-ground range, and a
+// second identical build (the scalar fallback path uses the same Ry) matches bin-for-bin.
+TEST(FrontierViewpoint, BlindMaskScalarVsTfPitch) {
+  BlindMask a = BlindMask::build(Rpitch(20.0), 0.51, 360, -7.0, 52.0);
+  BlindMask b = BlindMask::build(Rpitch(20.0), 0.51, 360, -7.0, 52.0);
+  ASSERT_TRUE(a.valid());
+  const double fwd = a.rBlind(0.0);
+  EXPECT_GT(fwd, 0.7);   // ~ h/tan(pitch - vmin) = 0.51/tan(27deg) ~ 1.0 m
+  EXPECT_LT(fwd, 1.4);
+  for (double th = -M_PI; th < M_PI; th += 0.1) EXPECT_DOUBLE_EQ(a.rBlind(th), b.rBlind(th));
+}
+
+// TEST 22 -- pitched LiDAR makes r_blind heading-dependent: forward sees closer than back.
+TEST(FrontierViewpoint, BlindMaskIsHeadingDependent) {
+  BlindMask m = BlindMask::build(Rpitch(20.0), 0.51, 360, -7.0, 52.0);
+  ASSERT_TRUE(m.valid());
+  EXPECT_LT(m.rBlind(0.0), m.rBlind(M_PI));  // forward blind boundary is nearer than rear
+}
+
+// TEST 23 -- no fixed standoff: only a candidate far enough to clear the forward blind
+// zone works, so the selector picks q_vis well beyond the old 0.75 m standoff.
+TEST(FrontierViewpoint, LocalSelectorNoFixedStandoff) {
+  GridQuery grid = frontierGrid();
+  ViewpointParams P = baseParams();
+  P.min_first_unknown_visible_fraction = 1.0;
+  FrontierGeometry g = computeFrontierGeometry(frontierCells(), grid, P);
+  ASSERT_TRUE(g.valid);
+  EXPECT_GT(g.normal.x(), 0.9);  // +x toward UNKNOWN
+  BlindMask mask = BlindMask::build(Rpitch(20.0), P.sensor_height_m, 360,
+                                    P.sensor_vertical_min_deg, P.sensor_vertical_max_deg);
+  auto U = computeFirstUnknownTargets(Eigen::Vector2d(0, 0), g, grid, P);
+  ASSERT_GT(U.size(), 0u);
+
+  ViewpointResult r = selectViewpointLocal(Eigen::Vector2d(0, 0), g, Eigen::Vector2d(-2.0, 0.0),
+                                           grid, P, mask, U);
+  ASSERT_TRUE(r.ok);
+  EXPECT_GT(-r.q.x(), 1.0);  // chose a pose > 1 m back (not the 0.75 m standoff)
+
+  // With a small search disk no far-enough pose exists -> no viewpoint.
+  ViewpointParams P2 = P;
+  P2.search_radius_m = 0.8;
+  ViewpointResult r2 = selectViewpointLocal(Eigen::Vector2d(0, 0), g, Eigen::Vector2d(-2.0, 0.0),
+                                            grid, P2, mask, U);
+  EXPECT_FALSE(r2.ok);
+}
+
+// TEST 24 -- a known OCCUPIED wall between q_vis and the first UNKNOWN blocks visibility.
+TEST(FrontierViewpoint, LocalSelectorWallOccludes) {
+  GridQuery grid = frontierGrid([](double x, double) { return x > -0.4 && x < -0.3; });  // wall
+  ViewpointParams P = baseParams();
+  P.min_first_unknown_visible_fraction = 1.0;
+  FrontierGeometry g = computeFrontierGeometry(frontierCells(), grid, P);
+  ASSERT_TRUE(g.valid);
+  BlindMask mask = BlindMask::build(Rpitch(20.0), P.sensor_height_m, 360,
+                                    P.sensor_vertical_min_deg, P.sensor_vertical_max_deg);
+  auto U = computeFirstUnknownTargets(Eigen::Vector2d(0, 0), g, grid, P);
+  ASSERT_GT(U.size(), 0u);
+  ViewpointResult r = selectViewpointLocal(Eigen::Vector2d(0, 0), g, Eigen::Vector2d(-2.0, 0.0),
+                                           grid, P, mask, U);
+  EXPECT_FALSE(r.ok);  // every far pose's ray crosses the occupied wall
+}
+
+// TEST 25 -- q_pre is derived so the q_pre->q_vis heading equals the selected yaw.
+TEST(FrontierViewpoint, LocalSelectorQPreDerivation) {
+  GridQuery grid = frontierGrid();
+  ViewpointParams P = baseParams();
+  P.min_first_unknown_visible_fraction = 1.0;
+  FrontierGeometry g = computeFrontierGeometry(frontierCells(), grid, P);
+  ASSERT_TRUE(g.valid);
+  BlindMask mask = BlindMask::build(Rpitch(20.0), P.sensor_height_m, 360,
+                                    P.sensor_vertical_min_deg, P.sensor_vertical_max_deg);
+  auto U = computeFirstUnknownTargets(Eigen::Vector2d(0, 0), g, grid, P);
+  ViewpointResult r = selectViewpointLocal(Eigen::Vector2d(0, 0), g, Eigen::Vector2d(-2.0, 0.0),
+                                           grid, P, mask, U);
+  ASSERT_TRUE(r.ok);
+  const double seg_yaw = std::atan2(r.q.y() - r.q_pre.y(), r.q.x() - r.q_pre.x());
+  const double err = std::atan2(std::sin(seg_yaw - r.yaw), std::cos(seg_yaw - r.yaw));
+  EXPECT_NEAR(err, 0.0, 1e-6);
+}
+
+// ---- Step 9: pre-observation route known-FREE validation ------------------
+namespace {
+// A grid FREE inside [0,10]x[0,10] (minus unknown/occ regions); everything else OOB
+// (=> UNKNOWN semantics). unk/occ are optional analytic regions in-bounds.
+GridQuery boundedGrid(std::function<bool(double, double)> unk = nullptr,
+                      std::function<bool(double, double)> occ = nullptr) {
+  GridQuery g;
+  g.resolution = 0.15;
+  g.isOccupied = [occ](double x, double y) { return occ && occ(x, y); };
+  g.isUnknown = [unk](double x, double y) {
+    if (x < 0.0 || x > 10.0 || y < 0.0 || y > 10.0) return true;  // OOB => unknown
+    return unk && unk(x, y);
+  };
+  g.isFree = [g](double x, double y) {
+    if (x < 0.0 || x > 10.0 || y < 0.0 || y > 10.0) return false;      // OOB not free
+    return !g.isUnknown(x, y) && !g.isOccupied(x, y);
+  };
+  return g;
+}
+ViewpointParams pathParams() {
+  ViewpointParams P;
+  P.robot_bbox_x = 0.6; P.robot_bbox_y = 0.6; P.footprint_margin_m = 0.10;  // r_safe ~0.52
+  return P;
+}
+}  // namespace
+
+// 1 - entirely known-FREE -> pass.
+TEST(FrontierViewpoint, PrePathAllFree) {
+  GridQuery g = boundedGrid();
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> path = {{2, 5}, {3, 5}, {4, 5}};
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::NONE);
+}
+// 2 - centerline enters UNKNOWN -> fail.
+TEST(FrontierViewpoint, PrePathCenterlineUnknown) {
+  GridQuery g = boundedGrid([](double x, double) { return x > 4.0; });  // unknown x>4
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> path = {{2, 5}, {5, 5}};  // ends in unknown
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::FOOTPRINT_UNKNOWN);
+}
+// 3 - footprint overlaps UNKNOWN while centerline is FREE -> fail.
+TEST(FrontierViewpoint, PrePathFootprintUnknown) {
+  GridQuery g = boundedGrid([](double, double y) { return y > 5.3; });  // unknown y>5.3
+  ViewpointParams P = pathParams();  // footprint disc at y=5.0 reaches into y>5.3
+  std::vector<Eigen::Vector2d> path = {{2, 5.0}, {4, 5.0}};  // centerline free, disc clips unknown
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::FOOTPRINT_UNKNOWN);
+}
+// 4 - footprint overlaps OCCUPIED -> fail (occ dominates).
+TEST(FrontierViewpoint, PrePathFootprintOccupied) {
+  GridQuery g = boundedGrid(nullptr, [](double x, double y) {
+    return std::hypot(x - 3.3, y - 5.0) < 0.2;  // small occupied blob near the path
+  });
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> path = {{2, 5.0}, {4, 5.0}};
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::FOOTPRINT_OCCUPIED);
+}
+// 5 - UNKNOWN between two sparse vertices -> fail (interpolation catches it).
+TEST(FrontierViewpoint, PrePathUnknownBetweenSparseVertices) {
+  GridQuery g = boundedGrid([](double x, double) { return x > 4.5 && x < 5.5; });  // unknown slab
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> path = {{2, 5}, {8, 5}};  // sparse: slab is only mid-segment
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::FOOTPRINT_UNKNOWN);
+}
+// 6 - OOB footprint -> fail.
+TEST(FrontierViewpoint, PrePathOutOfBounds) {
+  GridQuery g = boundedGrid();
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> path = {{2, 5}, {0.2, 5}};  // disc reaches x<0 (OOB)
+  EXPECT_EQ(pathFootprintKnownFree(path, g, P), ViewpointReject::FOOTPRINT_UNKNOWN);
+}
+// 7 - first candidate route fails, second succeeds (node's "try next ranked" proxy).
+TEST(FrontierViewpoint, PrePathFirstFailsSecondSucceeds) {
+  GridQuery g = boundedGrid([](double x, double) { return x > 4.0 && x < 4.6; });  // unknown wall
+  ViewpointParams P = pathParams();
+  std::vector<Eigen::Vector2d> cand1 = {{2, 5}, {6, 5}};        // crosses the unknown wall
+  std::vector<Eigen::Vector2d> cand2 = {{2, 5}, {2, 8}, {2, 2}};  // detour stays free
+  EXPECT_NE(pathFootprintKnownFree(cand1, g, P), ViewpointReject::NONE);
+  EXPECT_EQ(pathFootprintKnownFree(cand2, g, P), ViewpointReject::NONE);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

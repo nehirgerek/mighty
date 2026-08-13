@@ -38,6 +38,7 @@ const char* viewpointRejectStr(ViewpointReject r) {
     case ViewpointReject::LOW_CLEARANCE: return "low_clearance";
     case ViewpointReject::LOW_VISIBILITY: return "insufficient_visibility";
     case ViewpointReject::APPROACH_UNSAFE: return "approach_unsafe";
+    case ViewpointReject::NO_TARGETS: return "no_targets";
     case ViewpointReject::NO_CANDIDATE: return "no_candidate";
   }
   return "?";
@@ -138,6 +139,26 @@ ViewpointReject footprintCheck(const Eigen::Vector2d& q, const GridQuery& grid,
   if (any_occ) return ViewpointReject::FOOTPRINT_OCCUPIED;  // OCC dominates
   if (any_unk) return ViewpointReject::FOOTPRINT_UNKNOWN;
   return ViewpointReject::NONE;
+}
+
+ViewpointReject pathFootprintKnownFree(const std::vector<Eigen::Vector2d>& path,
+                                       const GridQuery& grid, const ViewpointParams& P) {
+  if (path.size() < 2) return path.empty() ? ViewpointReject::NO_CANDIDATE : ViewpointReject::NONE;
+  const double step = std::max(1e-3, grid.resolution);  // sample spacing <= grid resolution
+  bool any_unk = false;
+  for (size_t i = 1; i < path.size(); ++i) {
+    const Eigen::Vector2d a = path[i - 1], b = path[i];
+    const double len = (b - a).norm();
+    const int ns = std::max(1, static_cast<int>(std::ceil(len / step)));
+    for (int k = 0; k <= ns; ++k) {
+      const double u = static_cast<double>(k) / ns;
+      const Eigen::Vector2d p = a + u * (b - a);
+      const ViewpointReject fp = footprintCheck(p, grid, P);  // full footprint disc, occ-only
+      if (fp == ViewpointReject::FOOTPRINT_OCCUPIED) return fp;  // OCC dominates -> fail now
+      if (fp == ViewpointReject::FOOTPRINT_UNKNOWN) any_unk = true;
+    }
+  }
+  return any_unk ? ViewpointReject::FOOTPRINT_UNKNOWN : ViewpointReject::NONE;
 }
 
 bool segmentFootprintSafe(const Eigen::Vector2d& a, const Eigen::Vector2d& b, const GridQuery& grid,
@@ -400,6 +421,217 @@ ViewpointResult selectViewpoint(const Eigen::Vector2d& centroid, const FrontierG
   res.visible_samples = best.visible_samples;
   res.total_samples = static_cast<int>(P.target_depths_m.size());
   res.target_samples = best.target_samples;
+  res.reason = ViewpointReject::NONE;
+  return res;
+}
+
+// ===========================================================================
+// v3: near-ground blind mask
+// ===========================================================================
+BlindMask BlindMask::build(const Eigen::Matrix3d& R_base_lidar, double h, int n_bins,
+                           double e_lo_deg, double e_hi_deg) {
+  BlindMask m;
+  m.n_ = std::max(1, n_bins);
+  m.r_.assign(m.n_, std::numeric_limits<double>::infinity());
+  if (h <= 1e-6) return m;
+
+  const double two_pi = 2.0 * M_PI;
+  const double az_step = M_PI / 180.0 * 0.5;   // 0.5 deg azimuth sampling
+  const double el_step = M_PI / 180.0 * 0.25;  // 0.25 deg elevation sampling
+  const double e_lo = e_lo_deg * M_PI / 180.0;
+  const double e_hi = std::min(0.0, e_hi_deg * M_PI / 180.0);  // only downward rays hit ground
+
+  for (double alpha = -M_PI; alpha < M_PI; alpha += az_step) {
+    const double ca = std::cos(alpha), sa = std::sin(alpha);
+    for (double beta = e_lo; beta <= e_hi + 1e-9; beta += el_step) {
+      const double cb = std::cos(beta), sb = std::sin(beta);
+      const Eigen::Vector3d d_L(cb * ca, cb * sa, sb);  // lidar-frame ray
+      const Eigen::Vector3d d_B = R_base_lidar * d_L;   // base frame
+      if (d_B.z() >= -1e-9) continue;                    // not pointing at the ground
+      const double lambda = -h / d_B.z();                // flat-ground intersection
+      const Eigen::Vector3d p_B = lambda * d_B;
+      const double theta = std::atan2(p_B.y(), p_B.x());
+      const double rho = std::hypot(p_B.x(), p_B.y());
+      int bin = static_cast<int>(std::floor((theta + M_PI) / two_pi * m.n_));
+      if (bin < 0) bin = 0;
+      if (bin >= m.n_) bin = m.n_ - 1;
+      if (rho < m.r_[bin]) m.r_[bin] = rho;
+    }
+  }
+  return m;
+}
+
+double BlindMask::rBlind(double theta) const {
+  if (n_ <= 0) return std::numeric_limits<double>::infinity();
+  const double two_pi = 2.0 * M_PI;
+  double t = std::fmod(theta + M_PI, two_pi);
+  if (t < 0.0) t += two_pi;
+  int bin = static_cast<int>(std::floor(t / two_pi * n_));
+  if (bin < 0) bin = 0;
+  if (bin >= n_) bin = n_ - 1;
+  return r_[bin];
+}
+
+// ===========================================================================
+// v3: first-UNKNOWN targets (bounded local scan; no synthetic points)
+// ===========================================================================
+std::vector<Eigen::Vector2d> computeFirstUnknownTargets(const Eigen::Vector2d& C,
+                                                        const FrontierGeometry& geom,
+                                                        const GridQuery& grid,
+                                                        const ViewpointParams& P) {
+  std::vector<Eigen::Vector2d> out;
+  if (!geom.valid || !grid.isUnknown || !grid.isFree) return out;
+  const double res = std::max(1e-3, grid.resolution);
+  const double half_w = P.critical_frontier_half_width_m;
+  const double depth = std::max(4.0 * res, 0.5);  // first UNKNOWN sits at the boundary
+  const Eigen::Vector2d n = geom.normal, t = geom.tangent;
+
+  double minx = 1e18, miny = 1e18, maxx = -1e18, maxy = -1e18;
+  for (double a : {-res, depth}) {
+    for (double b : {-half_w, half_w}) {
+      const Eigen::Vector2d c = C + a * n + b * t;
+      minx = std::min(minx, c.x()); maxx = std::max(maxx, c.x());
+      miny = std::min(miny, c.y()); maxy = std::max(maxy, c.y());
+    }
+  }
+  const int dx4[] = {1, -1, 0, 0};
+  const int dy4[] = {0, 0, 1, -1};
+  for (double y = miny; y <= maxy + 1e-9; y += res) {
+    for (double x = minx; x <= maxx + 1e-9; x += res) {
+      const Eigen::Vector2d rel(x - C.x(), y - C.y());
+      if (std::abs(rel.dot(t)) > half_w) continue;  // outside the critical tangent band
+      if (rel.dot(n) < -res) continue;               // free side, skip
+      if (!grid.isUnknown(x, y)) continue;
+      bool adj_free = false;                          // adjacent to the FREE frontier
+      for (int k = 0; k < 4 && !adj_free; ++k)
+        if (grid.isFree(x + dx4[k] * res, y + dy4[k] * res)) adj_free = true;
+      if (adj_free) out.emplace_back(x, y);
+    }
+  }
+  return out;
+}
+
+// ===========================================================================
+// v3: local q_vis visibility maneuver
+// ===========================================================================
+namespace {
+inline bool footprintFree(const Eigen::Vector2d& q, const GridQuery& grid,
+                          const ViewpointParams& P) {
+  return footprintCheck(q, grid, P) == ViewpointReject::NONE;
+}
+// Cheap 2-D occupancy ray: true if NO known-OCCUPIED cell blocks a->b (UNKNOWN is
+// transparent -- it is exactly what we want to observe).
+bool rayUnblocked(const Eigen::Vector2d& a, const Eigen::Vector2d& b, const GridQuery& grid) {
+  if (!grid.isOccupied) return true;
+  const double dist = (b - a).norm();
+  const int n = std::max(1, static_cast<int>(std::ceil(dist / 0.05)));
+  for (int k = 1; k < n; ++k) {
+    const double u = static_cast<double>(k) / n;
+    const Eigen::Vector2d s = a + u * (b - a);
+    if (grid.isOccupied(s.x(), s.y())) return false;
+  }
+  return true;
+}
+}  // namespace
+
+ViewpointResult selectViewpointLocal(const Eigen::Vector2d& C, const FrontierGeometry& geom,
+                                     const Eigen::Vector2d& robot_xy, const GridQuery& grid,
+                                     const ViewpointParams& P, const BlindMask& mask,
+                                     const std::vector<Eigen::Vector2d>& U_first,
+                                     const std::vector<Eigen::Vector2d>& attempted) {
+  ViewpointResult res;
+  res.geom = geom;
+  if (!geom.valid) { res.reason = ViewpointReject::PCA_INVALID; return res; }
+  if (U_first.empty()) { res.reason = ViewpointReject::NO_TARGETS; return res; }
+
+  Eigen::Vector2d u_bar = Eigen::Vector2d::Zero();
+  for (const auto& u : U_first) u_bar += u;
+  u_bar /= static_cast<double>(U_first.size());
+
+  struct Cand {
+    Eigen::Vector2d q, q_pre;
+    double psi, dpsi, min_margin, clearance, robot_dist;
+    int vis, tot;
+  };
+  std::vector<Cand> valid;
+
+  const double step = std::max(1e-3, P.position_step_m);
+  const double R = P.search_radius_m;
+  const int max_pos = std::max(1, P.max_candidate_positions);
+  const double n_tol = 0.5 * std::max(1e-3, grid.resolution);
+  int positions_tested = 0;
+
+  for (double dy = -R; dy <= R + 1e-9 && positions_tested < max_pos; dy += step) {
+    for (double dx = -R; dx <= R + 1e-9 && positions_tested < max_pos; dx += step) {
+      if (dx * dx + dy * dy > R * R) continue;
+      const Eigen::Vector2d q(C.x() + dx, C.y() + dy);
+      if ((q - C).dot(geom.normal) > n_tol) continue;   // stay on the known/free side of F
+      if (!footprintFree(q, grid, P)) continue;
+      ++positions_tested;
+      bool tried = false;
+      for (const auto& a : attempted)
+        if ((q - a).norm() <= step) { tried = true; break; }
+      if (tried) continue;
+
+      const double psi0 = std::atan2(u_bar.y() - q.y(), u_bar.x() - q.x());
+      double esdf_clear = std::numeric_limits<double>::infinity();
+      if (grid.esdfInBounds && grid.esdfDistance && grid.esdfInBounds(q.x(), q.y()))
+        esdf_clear = grid.esdfDistance(q.x(), q.y());
+
+      for (double off_deg : P.heading_offsets_deg) {
+        const double psi = psi0 + off_deg * M_PI / 180.0;
+        const double cpsi = std::cos(psi), spsi = std::sin(psi);
+        int vis = 0;
+        double min_margin = std::numeric_limits<double>::infinity();
+        for (const auto& u : U_first) {
+          const Eigen::Vector2d vM = u - q;
+          const double bx = cpsi * vM.x() + spsi * vM.y();   // rotate map->rover by -psi
+          const double by = -spsi * vM.x() + cpsi * vM.y();
+          const double rho = std::hypot(bx, by);
+          const double theta = std::atan2(by, bx);
+          if (rho - mask.rBlind(theta) < P.blind_margin_m) continue;  // in/at blind boundary
+          if (!rayUnblocked(q, u, grid)) continue;                     // OCCUPIED blocks ray
+          ++vis;
+          min_margin = std::min(min_margin, rho - mask.rBlind(theta));
+        }
+        const double V_first = static_cast<double>(vis) / static_cast<double>(U_first.size());
+        if (V_first < P.min_first_unknown_visible_fraction) continue;
+
+        const Eigen::Vector2d q_pre = q - P.pre_viewpoint_len_m * Eigen::Vector2d(cpsi, spsi);
+        if (!footprintFree(q_pre, grid, P)) continue;
+        if (!segmentFootprintSafe(q_pre, q, grid, P)) continue;
+
+        Cand c;
+        c.q = q; c.q_pre = q_pre; c.psi = psi; c.dpsi = std::abs(off_deg);
+        c.min_margin = min_margin; c.clearance = esdf_clear;
+        c.robot_dist = (q_pre - robot_xy).norm(); c.vis = vis;
+        c.tot = static_cast<int>(U_first.size());
+        valid.push_back(c);
+      }
+    }
+  }
+
+  if (valid.empty()) { res.reason = ViewpointReject::LOW_VISIBILITY; return res; }
+
+  // Lexicographic: (1) shorter robot->q_pre, (2) larger min blind margin,
+  // (3) smaller |dpsi|, (4) larger ESDF clearance.
+  std::sort(valid.begin(), valid.end(), [](const Cand& a, const Cand& b) {
+    if (std::abs(a.robot_dist - b.robot_dist) > 1e-6) return a.robot_dist < b.robot_dist;
+    if (std::abs(a.min_margin - b.min_margin) > 1e-6) return a.min_margin > b.min_margin;
+    if (std::abs(a.dpsi - b.dpsi) > 1e-6) return a.dpsi < b.dpsi;
+    return a.clearance > b.clearance;
+  });
+
+  const Cand& best = valid.front();
+  res.ok = true;
+  res.q = best.q;
+  res.q_pre = best.q_pre;
+  res.yaw = best.psi;
+  res.s = 0.0;
+  res.target = u_bar;
+  res.visible_samples = best.vis;
+  res.total_samples = best.tot;
+  res.clearance_m = best.clearance;
   res.reason = ViewpointReject::NONE;
   return res;
 }

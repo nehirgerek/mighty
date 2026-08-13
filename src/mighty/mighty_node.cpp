@@ -803,6 +803,18 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("exploration.viewpoint.base_frame", std::string(""));
   this->declare_parameter("exploration.viewpoint.lidar_frame", std::string(""));
   this->declare_parameter("exploration.viewpoint.require_sensor_tf", true);
+  // v3 local q_vis visibility maneuver
+  this->declare_parameter("exploration.viewpoint.use_local_qvis", true);
+  this->declare_parameter("exploration.viewpoint.search_radius_m", 2.5);
+  this->declare_parameter("exploration.viewpoint.position_step_m", 0.25);
+  this->declare_parameter("exploration.viewpoint.max_candidate_positions", 500);
+  this->declare_parameter("exploration.viewpoint.critical_frontier_half_width_m", 0.45);
+  this->declare_parameter("exploration.viewpoint.heading_offsets_deg",
+                          std::vector<double>{-30.0, -15.0, 0.0, 15.0, 30.0});
+  this->declare_parameter("exploration.viewpoint.blind_mask_azimuth_bins", 360);
+  this->declare_parameter("exploration.viewpoint.blind_margin_m", 0.25);
+  this->declare_parameter("exploration.viewpoint.min_first_unknown_visible_fraction", 1.0);
+  this->declare_parameter("exploration.viewpoint.max_qvis_plan_attempts", 5);
   this->declare_parameter("exploration.visited_map.center_x", 0.0);
   this->declare_parameter("exploration.visited_map.center_y", 0.0);
   this->declare_parameter("exploration.visited_map.width_m", 100.0);
@@ -1205,6 +1217,23 @@ void MIGHTY_NODE::setParameters() {
     par_.expl_view_lidar_frame = this->get_parameter("exploration.viewpoint.lidar_frame").as_string();
     par_.expl_view_require_sensor_tf =
         this->get_parameter("exploration.viewpoint.require_sensor_tf").as_bool();
+    vp.use_local_qvis =
+        this->get_parameter("exploration.viewpoint.use_local_qvis").as_bool();
+    vp.search_radius_m = this->get_parameter("exploration.viewpoint.search_radius_m").as_double();
+    vp.position_step_m = this->get_parameter("exploration.viewpoint.position_step_m").as_double();
+    vp.max_candidate_positions =
+        static_cast<int>(this->get_parameter("exploration.viewpoint.max_candidate_positions").as_int());
+    vp.critical_frontier_half_width_m =
+        this->get_parameter("exploration.viewpoint.critical_frontier_half_width_m").as_double();
+    vp.heading_offsets_deg =
+        this->get_parameter("exploration.viewpoint.heading_offsets_deg").as_double_array();
+    vp.blind_mask_azimuth_bins =
+        static_cast<int>(this->get_parameter("exploration.viewpoint.blind_mask_azimuth_bins").as_int());
+    vp.blind_margin_m = this->get_parameter("exploration.viewpoint.blind_margin_m").as_double();
+    vp.min_first_unknown_visible_fraction =
+        this->get_parameter("exploration.viewpoint.min_first_unknown_visible_fraction").as_double();
+    vp.max_qvis_plan_attempts =
+        static_cast<int>(this->get_parameter("exploration.viewpoint.max_qvis_plan_attempts").as_int());
   }
   par_.expl_visited_map_center_x   = this->get_parameter("exploration.visited_map.center_x").as_double();
   par_.expl_visited_map_center_y   = this->get_parameter("exploration.visited_map.center_y").as_double();
@@ -1966,45 +1995,77 @@ MIGHTY_NODE::ObsStart MIGHTY_NODE::beginViewpointAttempt(uint64_t fid, const Eig
   const mighty::SensorExtrinsics extr = buildSensorExtrinsics();
   if (par_.expl_view_require_sensor_tf && !extr.valid) return ObsStart::WAIT_TF;
 
-  // Recompute viewpoints from the CURRENT map (candidates from a previous attempt are
-  // stale after the map updated during the last observation).
-  const mighty::GridQuery gq = buildViewpointGridQuery();
-  const mighty::ViewpointResult vp =
-      mighty::selectViewpoint(C, geom, robot_xy, gq, par_.expl_viewpoint, extr);
-  if (!vp.ok) return ObsStart::NO_VIEWPOINT;
-
-  // Pick the best ranked pose whose lateral offset materially differs from every offset
-  // already tried this episode (so we don't re-attempt the same failed q*).
-  const double eps = 0.5 * par_.expl_viewpoint.lateral_step_m;
-  const mighty::ViewpointPose* chosen = nullptr;
-  for (const auto& pose : vp.ranked) {
-    bool tried = false;
-    for (double s : obs_attempted_s_)
-      if (std::abs(s - pose.s) <= eps) { tried = true; break; }
-    if (!tried) { chosen = &pose; break; }
+  // Rebuild the near-ground blind mask only when the extrinsic rotation changes.
+  const Eigen::Matrix3d R_used =
+      extr.valid ? extr.R_base_lidar
+                 : Eigen::Matrix3d(Eigen::AngleAxisd(
+                       par_.expl_viewpoint.sensor_mount_pitch_deg * M_PI / 180.0,
+                       Eigen::Vector3d::UnitY()));
+  if (!blind_mask_.valid() || (R_used - blind_mask_R_).norm() > 1e-6) {
+    blind_mask_ = mighty::BlindMask::build(R_used, par_.expl_viewpoint.sensor_height_m,
+                                           par_.expl_viewpoint.blind_mask_azimuth_bins,
+                                           par_.expl_viewpoint.sensor_vertical_min_deg,
+                                           par_.expl_viewpoint.sensor_vertical_max_deg);
+    blind_mask_R_ = R_used;
+    RCLCPP_INFO(this->get_logger(), "[expl_view] blind mask rebuilt (extr=%s, r_blind(0)=%.2f m)",
+                extr.valid ? "tf" : "fallback", blind_mask_.rBlind(0.0));
   }
-  if (chosen == nullptr) return ObsStart::NO_VIEWPOINT;  // every current candidate already tried
 
-  // Fresh strip snapshot for THIS attempt (own N_unknown_before).
+  const mighty::GridQuery gq = buildViewpointGridQuery();
+  const auto t0 = std::chrono::steady_clock::now();
+
+  mighty::ViewpointResult vp;
+  size_t n_targets = 0;
+  if (par_.expl_viewpoint.use_local_qvis) {
+    // v3: first-UNKNOWN targets + local free-space q_vis over the CURRENT map.
+    const std::vector<Eigen::Vector2d> U = computeFirstUnknownTargets(C, geom, gq, par_.expl_viewpoint);
+    n_targets = U.size();
+    if (U.empty()) return ObsStart::EMPTY_STRIP;  // nothing to observe behind this frontier
+    vp = mighty::selectViewpointLocal(C, geom, robot_xy, gq, par_.expl_viewpoint, blind_mask_, U,
+                                      obs_attempted_pos_);
+    if (!vp.ok) return ObsStart::NO_VIEWPOINT;
+    obs_attempted_pos_.push_back(vp.q);  // don't re-try this q_vis on recompute
+  } else {
+    // Legacy fixed-standoff selector (debug/regression), pick an untried lateral offset.
+    const mighty::ViewpointResult legacy =
+        mighty::selectViewpoint(C, geom, robot_xy, gq, par_.expl_viewpoint, extr);
+    if (!legacy.ok) return ObsStart::NO_VIEWPOINT;
+    const double eps = 0.5 * par_.expl_viewpoint.lateral_step_m;
+    const mighty::ViewpointPose* chosen = nullptr;
+    for (const auto& pose : legacy.ranked) {
+      bool tried = false;
+      for (double s : obs_attempted_s_)
+        if (std::abs(s - pose.s) <= eps) { tried = true; break; }
+      if (!tried) { chosen = &pose; break; }
+    }
+    if (chosen == nullptr) return ObsStart::NO_VIEWPOINT;
+    obs_attempted_s_.push_back(chosen->s);
+    vp = legacy;
+    vp.q = chosen->q; vp.q_pre = chosen->q_pre; vp.yaw = chosen->yaw; vp.s = chosen->s;
+  }
+  const double sel_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+  // Fresh strip snapshot for THIS attempt (own N_unknown_before) for the reveal test.
   obs_strip_snapshot_ = mighty::snapshotTargetStripUnknown(C, geom, gq, par_.expl_viewpoint);
   if (obs_strip_snapshot_.empty()) return ObsStart::EMPTY_STRIP;
 
   obs_frontier_id_ = fid;
-  obs_q_     = chosen->q;
-  obs_q_pre_ = chosen->q_pre;
-  obs_yaw_   = chosen->yaw;
-  obs_attempted_s_.push_back(chosen->s);
+  obs_q_     = vp.q;
+  obs_q_pre_ = vp.q_pre;
+  obs_yaw_   = vp.yaw;
+  obs_prepath_checked_ = false;   // Step 9: validate the HGP route to this q_pre first
   obs_phase_ = ObsPhase::APPROACH_PRE;
   mighty_ptr_->setGoalRadiusOverride(par_.expl_viewpoint.arrival_tol_m);
   RCLCPP_INFO(this->get_logger(),
     "[expl_view] terminal radius override ON: %.2f m", par_.expl_viewpoint.arrival_tol_m);
   issueViewpointGoal(obs_q_pre_, obs_yaw_);  // stage 1: drive to q_pre
   RCLCPP_INFO(this->get_logger(),
-    "[expl_view] frontier=%lu attempt s=%.2f q*=(%.2f,%.2f) q_pre=(%.2f,%.2f) yaw=%.0fdeg "
-    "strip=%zu extr=%s",
-    static_cast<unsigned long>(fid), chosen->s, obs_q_.x(), obs_q_.y(), obs_q_pre_.x(),
-    obs_q_pre_.y(), obs_yaw_ * 180.0 / M_PI, obs_strip_snapshot_.size(),
-    extr.valid ? "tf" : "fallback");
+    "[expl_view] frontier=%lu first_unknown=%zu q_vis=(%.2f,%.2f) q_pre=(%.2f,%.2f) yaw=%.0fdeg "
+    "dist_from_frontier=%.2fm strip=%zu extr=%s selector_ms=%.2f",
+    static_cast<unsigned long>(fid), n_targets, obs_q_.x(), obs_q_.y(), obs_q_pre_.x(),
+    obs_q_pre_.y(), obs_yaw_ * 180.0 / M_PI, (obs_q_ - C).norm(), obs_strip_snapshot_.size(),
+    extr.valid ? "tf" : "fallback", sel_ms);
   return ObsStart::STARTED;
 }
 
@@ -2040,6 +2101,62 @@ bool MIGHTY_NODE::tickViewpointObservation() {
   const double tol = par_.expl_viewpoint.arrival_tol_m;  // core MIGHTY drives to this via override
 
   if (obs_phase_ == ObsPhase::APPROACH_PRE) {
+    // Step 9: before committing to the maneuver, validate that the planner's actual
+    // route to q_pre stays entirely in known-FREE space for the rover footprint (the
+    // robot must not reach q_pre by cutting through UNKNOWN it was meant to observe).
+    if (!obs_prepath_checked_) {
+      vec_Vecf<3> gp;
+      mighty_ptr_->getGlobalPath(gp);
+      // Wait until the planner has produced a fresh path whose end is ~q_pre.
+      if (gp.size() >= 2 &&
+          (Eigen::Vector2d(gp.back()(0), gp.back()(1)) - obs_q_pre_).norm() <= 0.5) {
+        std::vector<Eigen::Vector2d> path2d;
+        path2d.reserve(gp.size() + 1);
+        path2d.emplace_back(p.x(), p.y());  // start at the actual robot pose
+        for (const auto& w : gp) path2d.emplace_back(w(0), w(1));
+        const mighty::GridQuery gq = buildViewpointGridQuery();
+        const auto t0 = std::chrono::steady_clock::now();
+        const mighty::ViewpointReject pr =
+            mighty::pathFootprintKnownFree(path2d, gq, par_.expl_viewpoint);
+        const double val_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++obs_plan_attempts_;
+        RCLCPP_INFO(this->get_logger(),
+          "[expl_view] PREPATH candidate=%d path_samples=%zu known_free=%s reject_reason=%s "
+          "(validate_ms=%.2f)",
+          obs_plan_attempts_, path2d.size(), pr == mighty::ViewpointReject::NONE ? "true" : "false",
+          mighty::viewpointRejectStr(pr), val_ms);
+        if (pr != mighty::ViewpointReject::NONE) {
+          RCLCPP_WARN(this->get_logger(),
+            "[expl_view] PREPATH_%s: route to q_pre not known-FREE — rejecting maneuver",
+            pr == mighty::ViewpointReject::FOOTPRINT_OCCUPIED ? "OCCUPIED" : "UNKNOWN");
+          // Try the next-ranked q_vis (recompute from current map), bounded by attempts.
+          const FrontierRecord* rec =
+              frontier_manager_ ? frontier_manager_->find(obs_frontier_id_) : nullptr;
+          if (obs_plan_attempts_ >= par_.expl_viewpoint.max_qvis_plan_attempts || rec == nullptr ||
+              (rec->state != FrontierState::ACTIVE && rec->state != FrontierState::DORMANT)) {
+            if (frontier_manager_)
+              frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
+            endViewpointObservation();
+            exploration_active_ = false;
+            return true;
+          }
+          state cur2;
+          mighty_ptr_->getState(cur2);
+          const ObsStart r2 = beginViewpointAttempt(obs_frontier_id_, rec->centroid_xy,
+                                                    rec->geometry,
+                                                    Eigen::Vector2d(cur2.pos.x(), cur2.pos.y()));
+          if (r2 != ObsStart::STARTED) {
+            frontier_manager_->markInvalidated(obs_frontier_id_, this->now().seconds());
+            endViewpointObservation();
+            exploration_active_ = false;
+          }
+          return true;
+        }
+        obs_prepath_checked_ = true;  // route validated -> proceed to drive to q_pre
+      }
+      return true;  // still waiting for / just validated the path; don't test arrival yet
+    }
     const double d = (p - obs_q_pre_).norm();
     if (d <= tol) {
       RCLCPP_INFO(this->get_logger(), "[expl_view] reached q_pre: d=%.3f m (<= %.2f)", d, tol);
@@ -3762,7 +3879,9 @@ void MIGHTY_NODE::exploreSelectCallback() {
   // Perception-aware viewpoint: pick a safe standoff pose that can observe behind the
   // frontier (curb/step safety) instead of driving onto the FREE/UNKNOWN boundary.
   if (par_.expl_viewpoint.enabled && par_.vehicle_type != "uav") {
-    obs_attempted_s_.clear();  // fresh observation episode for this frontier
+    obs_attempted_s_.clear();    // fresh observation episode for this frontier
+    obs_attempted_pos_.clear();
+    obs_plan_attempts_ = 0;
     const auto t0 = std::chrono::steady_clock::now();
     const ObsStart r = beginViewpointAttempt(next->id, next->centroid_xy, next->geometry, robot_xy);
     const double vp_ms =

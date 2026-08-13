@@ -319,8 +319,13 @@ class MIGHTY_NODE : public rclcpp::Node {
   //   R>=thresh: success (release to WFD) ; R<thresh: next alternate / invalidate.
   enum class ObsPhase { IDLE, APPROACH_PRE, APPROACH_Q, DWELL };
   ObsPhase obs_phase_ = ObsPhase::IDLE;
-  std::vector<double> obs_attempted_s_;              // lateral offsets already tried this episode
+  std::vector<double> obs_attempted_s_;              // legacy: lateral offsets tried this episode
+  std::vector<Eigen::Vector2d> obs_attempted_pos_;   // v3: q_vis positions tried this episode
   std::vector<Eigen::Vector2d> obs_strip_snapshot_;  // UNKNOWN strip cells snapshotted this attempt
+  mighty::BlindMask blind_mask_;                     // cached near-ground blind boundary
+  Eigen::Matrix3d   blind_mask_R_ = Eigen::Matrix3d::Identity();  // extrinsic the mask was built for
+  bool     obs_prepath_checked_ = false;             // Step 9: this attempt's route validated?
+  int      obs_plan_attempts_   = 0;                 // Step 9: routes validated this episode
   Eigen::Vector2d obs_q_{0.0, 0.0};
   Eigen::Vector2d obs_q_pre_{0.0, 0.0};
   double   obs_yaw_ = 0.0;
