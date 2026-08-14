@@ -390,6 +390,15 @@ struct parameters {
   double expl_peer_visit_radius_m{2.0};       // mark frontier VISITED when any active peer is within this radius (sticky); 0 disables
   // Visualization
   bool   expl_publish_markers{true};
+
+  // --- Diagnostic 2.5-D terrain height-gap (READ-ONLY; no behavioral effect) ---
+  bool        expl_terrain_gap_enabled{false};
+  std::string expl_terrain_gap_elevation_topic{"elevation_mapping_node/elevation_map_raw"};
+  double      expl_terrain_gap_max_gap_width_m{1.0};
+  double      expl_terrain_gap_height_threshold_m{0.05};
+  int         expl_terrain_gap_min_pairs{5};
+  double      expl_terrain_gap_sample_radius_m{0.15};
+  bool        expl_terrain_gap_publish_markers{true};
 };
 
 struct BasisConverter {

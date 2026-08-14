@@ -31,6 +31,10 @@ enum class FrontierState {
 struct FrontierRecord {
   uint64_t        id            = 0;
   Eigen::Vector2d centroid_xy   = Eigen::Vector2d::Zero();   // world frame
+  // Actual frontier cells (world frame), copied from the matched/new FrontierCluster in
+  // update(). Used only by the read-only terrain-gap diagnostic; does not affect any
+  // matching / EMA / scoring / state logic.
+  std::vector<Eigen::Vector2d> cells;
   int             size_cells    = 0;
   double          first_seen_t  = 0.0;
   double          last_seen_t   = 0.0;

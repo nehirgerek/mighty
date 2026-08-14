@@ -74,6 +74,7 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
       if (r.state != FrontierState::VISITED) {
         r.centroid_xy = alpha * c.centroid + (1.0 - alpha) * r.centroid_xy;
         r.size_cells  = c.size_cells;
+        r.cells       = c.cells;  // for the read-only terrain-gap diagnostic
         r.aabb_min    = c.aabb_min;
         r.aabb_max    = c.aabb_max;
         r.state       = FrontierState::ACTIVE;
@@ -106,6 +107,7 @@ void FrontierManager::update(const std::vector<FrontierCluster>& fresh,
       r.id           = next_id_++;
       r.centroid_xy  = c.centroid;
       r.size_cells   = c.size_cells;
+      r.cells        = c.cells;  // for the read-only terrain-gap diagnostic
       r.aabb_min     = c.aabb_min;
       r.aabb_max     = c.aabb_max;
       r.first_seen_t = t_now;

@@ -328,6 +328,15 @@ mighty_node:
         # drives to them. A manual term_goal preempts; exploration resumes after
         # the manual goal is reached. See plan: snazzy-moseying-donut.md
         exploration.enabled: true                                # [-] Master switch
+        # Diagnostic 2.5-D terrain height-gap (READ-ONLY; no planning/state effect)
+        exploration.terrain_gap.enabled: true
+        exploration.terrain_gap.elevation_topic: "elevation_mapping_node/elevation_map_raw"
+        exploration.terrain_gap.max_gap_width_m: 1.0
+        exploration.terrain_gap.height_threshold_m: 0.05
+        exploration.terrain_gap.min_pairs: 5
+        exploration.terrain_gap.sample_radius_m: 0.15
+        exploration.terrain_gap.publish_markers: true
+
         exploration.select_rate_hz: 1.0                          # [Hz] Goal-selection tick
         exploration.default_goal_z: 0.0                          # [m]  z for issued exploration goals
         exploration.detector.cluster_min_cells: 6                # [cells] drop tiny frontier clusters

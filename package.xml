@@ -16,6 +16,9 @@
   <depend>example_interfaces</depend>
   <depend>dynus_interfaces</depend>
   <depend>visualization_msgs</depend>
+  <depend>grid_map_ros</depend>
+  <depend>grid_map_core</depend>
+  <depend>grid_map_msgs</depend>
   <depend>decomp_ros_msgs</depend>
   <depend>gazebo_msgs</depend>
   <depend>gazebo_ros</depend>

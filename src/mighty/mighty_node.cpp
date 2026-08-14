@@ -320,6 +320,22 @@ MIGHTY_NODE::MIGHTY_NODE() : Node("mighty_node") {
         std::bind(&MIGHTY_NODE::occ2DCallback, this, std::placeholders::_1), options_map);
     RCLCPP_INFO(this->get_logger(), "Occ2D: Subscribed to occ_2d_topic for ground robot A* planning");
 
+    // Diagnostic terrain height-gap: subscribe to the RAW elevation GridMap (read-only,
+    // shallow depth-1 so a 5 Hz map does not queue up). Same map callback group so the
+    // cached map is not raced against occ2DCallback / FrontierManager / exploreSelect.
+    if (par_.expl_terrain_gap_enabled) {
+      sub_elevation_ = this->create_subscription<grid_map_msgs::msg::GridMap>(
+          par_.expl_terrain_gap_elevation_topic, rclcpp::QoS(rclcpp::KeepLast(1)),
+          std::bind(&MIGHTY_NODE::elevationCallback, this, std::placeholders::_1), options_map);
+      RCLCPP_INFO(this->get_logger(),
+                  "[terrain_gap] Subscribed to raw elevation '%s' (diagnostic only; no planning effect)",
+                  par_.expl_terrain_gap_elevation_topic.c_str());
+      if (par_.expl_terrain_gap_publish_markers) {
+        pub_terrain_gaps_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+            "exploration/terrain_height_gaps", 10);
+      }
+    }
+
     // Frontier-based exploration. The detector + persistent manager run inside
     // occ2DCallback; the explore-select timer issues exploration goals through
     // the same pathway as a manual term_goal.
@@ -741,6 +757,15 @@ void MIGHTY_NODE::declareParameters() {
 
   // Frontier-based exploration (ground robot only).
   this->declare_parameter("exploration.enabled", false);
+  // Diagnostic 2.5-D terrain height-gap (read-only).
+  this->declare_parameter("exploration.terrain_gap.enabled", false);
+  this->declare_parameter("exploration.terrain_gap.elevation_topic",
+                          std::string("elevation_mapping_node/elevation_map_raw"));
+  this->declare_parameter("exploration.terrain_gap.max_gap_width_m", 1.0);
+  this->declare_parameter("exploration.terrain_gap.height_threshold_m", 0.05);
+  this->declare_parameter("exploration.terrain_gap.min_pairs", 5);
+  this->declare_parameter("exploration.terrain_gap.sample_radius_m", 0.15);
+  this->declare_parameter("exploration.terrain_gap.publish_markers", true);
   this->declare_parameter("exploration.select_rate_hz", 1.0);
   this->declare_parameter("exploration.default_goal_z", 0.0);
   this->declare_parameter("exploration.detector.cluster_min_cells", 6);
@@ -1100,6 +1125,19 @@ void MIGHTY_NODE::setParameters() {
 
   // Frontier-based exploration
   par_.expl_enabled              = this->get_parameter("exploration.enabled").as_bool();
+  par_.expl_terrain_gap_enabled  = this->get_parameter("exploration.terrain_gap.enabled").as_bool();
+  par_.expl_terrain_gap_elevation_topic =
+      this->get_parameter("exploration.terrain_gap.elevation_topic").as_string();
+  par_.expl_terrain_gap_max_gap_width_m =
+      this->get_parameter("exploration.terrain_gap.max_gap_width_m").as_double();
+  par_.expl_terrain_gap_height_threshold_m =
+      this->get_parameter("exploration.terrain_gap.height_threshold_m").as_double();
+  par_.expl_terrain_gap_min_pairs =
+      static_cast<int>(this->get_parameter("exploration.terrain_gap.min_pairs").as_int());
+  par_.expl_terrain_gap_sample_radius_m =
+      this->get_parameter("exploration.terrain_gap.sample_radius_m").as_double();
+  par_.expl_terrain_gap_publish_markers =
+      this->get_parameter("exploration.terrain_gap.publish_markers").as_bool();
   par_.expl_select_rate_hz       = this->get_parameter("exploration.select_rate_hz").as_double();
   par_.expl_default_goal_z       = this->get_parameter("exploration.default_goal_z").as_double();
   par_.expl_cluster_min_cells    = this->get_parameter("exploration.detector.cluster_min_cells").as_int();
@@ -3391,6 +3429,153 @@ void MIGHTY_NODE::occ2DCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr ms
 
 // ----------------------------------------------------------------------------
 
+void MIGHTY_NODE::elevationCallback(const grid_map_msgs::msg::GridMap::SharedPtr msg) {
+  // Cache only the latest RAW elevation GridMap (map/variance). Runs in cb_group_map_,
+  // so it is serialized against occ2DCallback / exploreSelectCallback.
+  grid_map::GridMap gm;
+  if (!grid_map::GridMapRosConverter::fromMessage(*msg, gm)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "[terrain_gap] failed to convert elevation GridMap message");
+    return;
+  }
+  elevation_map_ = std::move(gm);
+  elevation_frame_ = msg->header.frame_id;
+  have_elevation_ = true;
+}
+
+void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
+  if (!par_.expl_terrain_gap_enabled) return;
+  // Throttle to ~1 Hz unless the selected frontier changed (5 Hz map otherwise floods).
+  const double t = this->now().seconds();
+  if (next.id == last_terrain_gap_frontier_ && (t - last_terrain_gap_t_) < 1.0) return;
+  last_terrain_gap_t_ = t;
+  last_terrain_gap_frontier_ = next.id;
+
+  if (!have_elevation_ || !occ_grid_2d_ || next.cells.empty()) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[terrain_gap] frontier=%lu skip (%s)", static_cast<unsigned long>(next.id),
+      !have_elevation_ ? "no elevation map yet" : (next.cells.empty() ? "no current cells" : "no occ grid"));
+    return;
+  }
+
+  mighty::TerrainGapParams P;
+  P.max_gap_width_m    = par_.expl_terrain_gap_max_gap_width_m;
+  P.height_threshold_m = par_.expl_terrain_gap_height_threshold_m;
+  P.min_pairs          = par_.expl_terrain_gap_min_pairs;
+  P.sample_radius_m    = par_.expl_terrain_gap_sample_radius_m;
+
+  bool had_unk = false;
+  const auto geo = mighty::findGapPairs(*occ_grid_2d_, next.cells, P, &had_unk);
+  if (geo.empty()) {
+    RCLCPP_INFO(this->get_logger(), "[terrain_gap] frontier=%lu %s",
+                static_cast<unsigned long>(next.id),
+                had_unk ? "one-sided/no far FREE boundary" : "no UNKNOWN-adjacent cells");
+    return;
+  }
+
+  // Transform MIGHTY map-frame points into the elevation GridMap frame (identity if same).
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  if (par_.map_frame_id != elevation_frame_) {
+    try {
+      const auto tf =
+          tf2_buffer_->lookupTransform(elevation_frame_, par_.map_frame_id, tf2::TimePointZero);
+      T = tf2::transformToEigen(tf);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[terrain_gap] TF unavailable %s -> %s; skipping height check",
+        par_.map_frame_id.c_str(), elevation_frame_.c_str());
+      return;
+    }
+  }
+
+  // Robust median elevation over a small patch at a MIGHTY map-frame point.
+  auto sampleElev = [&](const Eigen::Vector2d& p_map, double& z, double& var) -> bool {
+    const Eigen::Vector3d pe = T * Eigen::Vector3d(p_map.x(), p_map.y(), 0.0);
+    const grid_map::Position center(pe.x(), pe.y());
+    if (!elevation_map_.isInside(center)) return false;
+    std::vector<double> zs, vs;
+    const bool has_var = elevation_map_.exists("variance");
+    for (grid_map::CircleIterator it(elevation_map_, center, P.sample_radius_m); !it.isPastEnd();
+         ++it) {
+      const float e = elevation_map_.at("elevation", *it);
+      if (!std::isfinite(e)) continue;
+      zs.push_back(e);
+      if (has_var) {
+        const float v = elevation_map_.at("variance", *it);
+        if (std::isfinite(v)) vs.push_back(v);
+      }
+    }
+    if (zs.size() < 3) return false;  // too few finite elevation samples
+    std::sort(zs.begin(), zs.end());
+    z = zs[zs.size() / 2];
+    if (!vs.empty()) { std::sort(vs.begin(), vs.end()); var = vs[vs.size() / 2]; }
+    else var = std::numeric_limits<double>::quiet_NaN();
+    return true;
+  };
+
+  std::vector<mighty::TerrainGapPair> valid;
+  valid.reserve(geo.size());
+  for (auto pr : geo) {
+    double za, zb, va = 0.0, vb = 0.0;
+    if (!sampleElev(pr.a_world, za, va) || !sampleElev(pr.b_world, zb, vb)) continue;
+    pr.z_a = za; pr.z_b = zb; pr.variance_a = va; pr.variance_b = vb; pr.dz = zb - za;
+    valid.push_back(pr);
+  }
+  const mighty::TerrainGapResult res = mighty::classifyTerrainGap(valid, P);
+
+  RCLCPP_INFO(this->get_logger(),
+    "[terrain_gap] frontier=%lu pairs=%zu dz=%.3f abs_dz=%.3f width=%.2f mad=%.3f class=%s "
+    "mighty_frame=%s elevation_frame=%s",
+    static_cast<unsigned long>(next.id), valid.size(), res.median_dz, res.median_abs_dz,
+    res.median_gap_width_m, res.mad_dz, mighty::terrainGapClassStr(res.classification),
+    par_.map_frame_id.c_str(), elevation_frame_.c_str());
+
+  // --- diagnostic markers (never touches the existing frontier markers) ---
+  if (!(par_.expl_terrain_gap_publish_markers && pub_terrain_gaps_)) return;
+  visualization_msgs::msg::MarkerArray arr;
+  const rclcpp::Time stamp = this->now();
+  auto baseMarker = [&](int id, int type, const std::string& ns, double sx, double r, double g,
+                        double b) {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = par_.map_frame_id;
+    m.header.stamp = stamp;
+    m.ns = ns;
+    m.id = id;
+    m.type = type;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.scale.x = m.scale.y = m.scale.z = sx;
+    m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.9;
+    m.pose.orientation.w = 1.0;
+    return m;
+  };
+  auto pt = [](const Eigen::Vector2d& v, double z) {
+    geometry_msgs::msg::Point p; p.x = v.x(); p.y = v.y(); p.z = z; return p;
+  };
+  auto a_m = baseMarker(0, visualization_msgs::msg::Marker::SPHERE_LIST, "terrain_gap_a", 0.10,
+                        0.1, 0.9, 0.2);
+  auto b_m = baseMarker(1, visualization_msgs::msg::Marker::SPHERE_LIST, "terrain_gap_b", 0.10,
+                        0.1, 0.4, 0.95);
+  auto ln = baseMarker(2, visualization_msgs::msg::Marker::LINE_LIST, "terrain_gap_pairs", 0.03,
+                       0.95, 0.85, 0.1);
+  const double z = par_.expl_default_goal_z + 0.05;
+  for (const auto& pr : res.pairs) {
+    a_m.points.push_back(pt(pr.a_world, z));
+    b_m.points.push_back(pt(pr.b_world, z));
+    ln.points.push_back(pt(pr.a_world, z));
+    ln.points.push_back(pt(pr.b_world, z));
+  }
+  auto txt = baseMarker(3, visualization_msgs::msg::Marker::TEXT_VIEW_FACING, "terrain_gap_text",
+                        0.25, 1.0, 1.0, 1.0);
+  txt.pose.position = pt(next.centroid_xy, z + 0.6);
+  char buf[256];
+  std::snprintf(buf, sizeof(buf), "frontier=%lu pairs=%zu dz=%.3f width=%.2f %s",
+                static_cast<unsigned long>(next.id), res.pairs.size(), res.median_dz,
+                res.median_gap_width_m, mighty::terrainGapClassStr(res.classification));
+  txt.text = buf;
+  arr.markers = {a_m, b_m, ln, txt};
+  pub_terrain_gaps_->publish(arr);
+}
+
 /**
  * @brief Frontier exploration: pick the next goal from the global frontier DB
  *        and issue it through the same pathway as a manual term_goal. Skipped
@@ -3516,6 +3701,10 @@ void MIGHTY_NODE::exploreSelectCallback() {
     // Only a manual user goal (true session boundary) resets the flag.
     return;
   }
+
+  // READ-ONLY 2.5-D terrain height-gap diagnostic for the selected frontier. Runs
+  // independently of and does NOT gate the goal below; it only logs / publishes markers.
+  if (par_.expl_terrain_gap_enabled) analyzeFrontierHeightGap(*next);
 
   geometry_msgs::msg::PoseStamped g;
   g.header.frame_id    = par_.map_frame_id;

@@ -78,6 +78,9 @@ struct FrontierRecord;
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include <grid_map_msgs/msg/grid_map.hpp>
+#include <grid_map_ros/GridMapRosConverter.hpp>
+#include "mighty/terrain_gap.hpp"
 #include "pcl_ros/transforms.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_msgs/msg/color_rgba.hpp"
@@ -299,6 +302,20 @@ class MIGHTY_NODE : public rclcpp::Node {
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_frontiers_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_explore_current_goal_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr pub_visited_map_;
+
+  // --- Diagnostic terrain height-gap (READ-ONLY; never affects planning/state) ---
+  rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr sub_elevation_;  // raw GridMap
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_terrain_gaps_;
+  grid_map::GridMap elevation_map_;                 // latest raw elevation map (cached)
+  std::string       elevation_frame_;               // its header.frame_id
+  bool              have_elevation_ = false;
+  double            last_terrain_gap_t_ = 0.0;       // ~1 Hz re-run throttle
+  uint64_t          last_terrain_gap_frontier_ = std::numeric_limits<uint64_t>::max();
+  /** @brief Cache the latest raw elevation GridMap (map/variance layers). */
+  void elevationCallback(const grid_map_msgs::msg::GridMap::SharedPtr msg);
+  /** @brief Read-only 2.5-D height-gap diagnostic for the selected ACTIVE frontier.
+   *  Never changes selection/goal/occupancy/state; logs + publishes markers only. */
+  void analyzeFrontierHeightGap(const FrontierRecord& next);
   // MinPos peer tracking (multi-robot frontier allocation)
   PeerTracker peer_tracker_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_peer_pose_;
