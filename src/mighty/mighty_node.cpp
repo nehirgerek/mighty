@@ -766,6 +766,7 @@ void MIGHTY_NODE::declareParameters() {
   this->declare_parameter("exploration.terrain_gap.min_pairs", 5);
   this->declare_parameter("exploration.terrain_gap.sample_radius_m", 0.15);
   this->declare_parameter("exploration.terrain_gap.publish_markers", true);
+  this->declare_parameter("exploration.terrain_gap.enable_frontier_gating", false);
   this->declare_parameter("exploration.select_rate_hz", 1.0);
   this->declare_parameter("exploration.default_goal_z", 0.0);
   this->declare_parameter("exploration.detector.cluster_min_cells", 6);
@@ -1138,6 +1139,8 @@ void MIGHTY_NODE::setParameters() {
       this->get_parameter("exploration.terrain_gap.sample_radius_m").as_double();
   par_.expl_terrain_gap_publish_markers =
       this->get_parameter("exploration.terrain_gap.publish_markers").as_bool();
+  par_.expl_terrain_gap_enable_frontier_gating =
+      this->get_parameter("exploration.terrain_gap.enable_frontier_gating").as_bool();
   par_.expl_select_rate_hz       = this->get_parameter("exploration.select_rate_hz").as_double();
   par_.expl_default_goal_z       = this->get_parameter("exploration.default_goal_z").as_double();
   par_.expl_cluster_min_cells    = this->get_parameter("exploration.detector.cluster_min_cells").as_int();
@@ -3443,11 +3446,13 @@ void MIGHTY_NODE::elevationCallback(const grid_map_msgs::msg::GridMap::SharedPtr
   have_elevation_ = true;
 }
 
-void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
-  if (!par_.expl_terrain_gap_enabled) return;
+std::optional<mighty::TerrainGapResult>
+MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
+  if (!par_.expl_terrain_gap_enabled) return std::nullopt;
   // Throttle to ~1 Hz unless the selected frontier changed (5 Hz map otherwise floods).
   const double t = this->now().seconds();
-  if (next.id == last_terrain_gap_frontier_ && (t - last_terrain_gap_t_) < 1.0) return;
+  if (next.id == last_terrain_gap_frontier_ && (t - last_terrain_gap_t_) < 1.0)
+    return std::nullopt;
   last_terrain_gap_t_ = t;
   last_terrain_gap_frontier_ = next.id;
 
@@ -3455,7 +3460,7 @@ void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "[terrain_gap] frontier=%lu skip (%s)", static_cast<unsigned long>(next.id),
       !have_elevation_ ? "no elevation map yet" : (next.cells.empty() ? "no current cells" : "no occ grid"));
-    return;
+    return std::nullopt;
   }
 
   mighty::TerrainGapParams P;
@@ -3470,7 +3475,7 @@ void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
     RCLCPP_INFO(this->get_logger(), "[terrain_gap] frontier=%lu %s",
                 static_cast<unsigned long>(next.id),
                 had_unk ? "one-sided/no far FREE boundary" : "no UNKNOWN-adjacent cells");
-    return;
+    return std::nullopt;
   }
 
   // Transform MIGHTY map-frame points into the elevation GridMap frame (identity if same).
@@ -3484,7 +3489,7 @@ void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "[terrain_gap] TF unavailable %s -> %s; skipping height check",
         par_.map_frame_id.c_str(), elevation_frame_.c_str());
-      return;
+      return std::nullopt;
     }
   }
 
@@ -3531,7 +3536,7 @@ void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
     par_.map_frame_id.c_str(), elevation_frame_.c_str());
 
   // --- diagnostic markers (never touches the existing frontier markers) ---
-  if (!(par_.expl_terrain_gap_publish_markers && pub_terrain_gaps_)) return;
+  if (!(par_.expl_terrain_gap_publish_markers && pub_terrain_gaps_)) return res;
   visualization_msgs::msg::MarkerArray arr;
   const rclcpp::Time stamp = this->now();
   auto baseMarker = [&](int id, int type, const std::string& ns, double sx, double r, double g,
@@ -3574,6 +3579,7 @@ void MIGHTY_NODE::analyzeFrontierHeightGap(const FrontierRecord& next) {
   txt.text = buf;
   arr.markers = {a_m, b_m, ln, txt};
   pub_terrain_gaps_->publish(arr);
+  return res;
 }
 
 /**
@@ -3702,9 +3708,43 @@ void MIGHTY_NODE::exploreSelectCallback() {
     return;
   }
 
-  // READ-ONLY 2.5-D terrain height-gap diagnostic for the selected frontier. Runs
-  // independently of and does NOT gate the goal below; it only logs / publishes markers.
-  if (par_.expl_terrain_gap_enabled) analyzeFrontierHeightGap(*next);
+  // 2.5-D terrain height-gap diagnostic for the selected frontier. Always logs /
+  // publishes markers (read-only). The optional result is reused below for the
+  // experimental high-side gating; the height-gap algorithm itself is unchanged.
+  const std::optional<mighty::TerrainGapResult> gap_result =
+      par_.expl_terrain_gap_enabled ? analyzeFrontierHeightGap(*next) : std::nullopt;
+
+  // EXPERIMENTAL high-side gating (off by default; enable_frontier_gating=false keeps the
+  // pure diagnostic-only behavior). When enabled, temporarily skip a frontier the robot
+  // would approach from the HIGH side of an unknown gap: classification==HEIGHT_DIFFERENCE
+  // with median_dz < -height_threshold. dz = z_B - z_A (far side minus selected-frontier
+  // side), so median_dz < 0 means the selected frontier (side A) sits HIGHER than the
+  // far side B. Every other case (SAME_LEVEL, positive dz, INSUFFICIENT_EVIDENCE,
+  // one-sided, no result) proceeds normally below.
+  if (par_.expl_terrain_gap_enable_frontier_gating && gap_result.has_value()) {
+    const mighty::TerrainGapResult& gr = *gap_result;
+    const double thr = par_.expl_terrain_gap_height_threshold_m;
+    if (gr.classification == mighty::TerrainGapClass::HEIGHT_DIFFERENCE &&
+        gr.median_dz < -thr) {
+      RCLCPP_WARN(this->get_logger(),
+        "[terrain_gap] HIGH_SIDE_BLOCKED frontier=%lu median_dz=%.3f m threshold=%.3f m "
+        "-> skipping exploration goal",
+        static_cast<unsigned long>(next->id), gr.median_dz, thr);
+      // TEMPORARY (this experiment only): mark ONLY this frontier VISITED so the selector
+      // moves on this cycle. Deliberately NOT INVALIDATED — its spatial keep-out/cooldown
+      // could suppress nearby alternate approaches to the same region.
+      // TODO: replace VISITED with a dedicated state (e.g. PERCEPTION_BLOCKED /
+      // UNRESOLVED_APPROACH) once the high-side skip behavior is validated on hardware.
+      frontier_manager_->markVisited(next->id);
+      return;  // let the next explore-select cycle pick another eligible frontier
+    }
+    // Non-blocking classifications: log the decision so the sign convention can be
+    // verified against the real rover before trusting the skip above.
+    RCLCPP_INFO(this->get_logger(),
+      "[terrain_gap] frontier=%lu %s median_dz=%+.3f m threshold=%.3f m -> proceeding",
+      static_cast<unsigned long>(next->id),
+      mighty::terrainGapClassStr(gr.classification), gr.median_dz, thr);
+  }
 
   geometry_msgs::msg::PoseStamped g;
   g.header.frame_id    = par_.map_frame_id;

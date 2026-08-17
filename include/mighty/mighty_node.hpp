@@ -315,7 +315,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   void elevationCallback(const grid_map_msgs::msg::GridMap::SharedPtr msg);
   /** @brief Read-only 2.5-D height-gap diagnostic for the selected ACTIVE frontier.
    *  Never changes selection/goal/occupancy/state; logs + publishes markers only. */
-  void analyzeFrontierHeightGap(const FrontierRecord& next);
+  std::optional<mighty::TerrainGapResult> analyzeFrontierHeightGap(const FrontierRecord& next);
   // MinPos peer tracking (multi-robot frontier allocation)
   PeerTracker peer_tracker_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_peer_pose_;

@@ -399,6 +399,10 @@ struct parameters {
   int         expl_terrain_gap_min_pairs{5};
   double      expl_terrain_gap_sample_radius_m{0.15};
   bool        expl_terrain_gap_publish_markers{true};
+  // EXPERIMENTAL: when true, skip an exploration frontier the robot would approach from
+  // the HIGH side of an unknown terrain gap (see exploreSelectCallback). Default false =
+  // pure diagnostic-only behavior (identical to before this experiment).
+  bool        expl_terrain_gap_enable_frontier_gating{false};
 };
 
 struct BasisConverter {

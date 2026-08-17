@@ -336,6 +336,7 @@ mighty_node:
         exploration.terrain_gap.min_pairs: 5
         exploration.terrain_gap.sample_radius_m: 0.15
         exploration.terrain_gap.publish_markers: true
+        exploration.terrain_gap.enable_frontier_gating: false    # [-]   EXPERIMENTAL: skip frontiers approached from the HIGH side of an unknown gap (false = diagnostic-only)
 
         exploration.select_rate_hz: 1.0                          # [Hz] Goal-selection tick
         exploration.default_goal_z: 0.0                          # [m]  z for issued exploration goals
