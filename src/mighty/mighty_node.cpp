@@ -1948,7 +1948,7 @@ void MIGHTY_NODE::publishVelocityInText(const Eigen::Vector3d& position, double 
 mighty::GridQuery MIGHTY_NODE::buildViewpointGridQuery() const {
   mighty::GridQuery gq;
   auto grid = current_detect_grid_;  // shared_ptr copy: keep alive for the callbacks
-  gq.resolution = grid ? grid->resolution() : par_.mighty_map_res;
+  gq.resolution = grid ? grid->resolution() : par_.res;
   gq.isFree     = [grid](double x, double y) { return grid && grid->isFreeWorld(x, y); };
   gq.isUnknown  = [grid](double x, double y) { return !grid || grid->isUnknownWorld(x, y); };
   gq.isOccupied = [grid](double x, double y) { return grid && grid->isOccupiedWorld(x, y); };
