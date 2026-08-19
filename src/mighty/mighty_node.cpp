@@ -2160,6 +2160,62 @@ bool MIGHTY_NODE::tickViewpointObservation() {
     const double d = (p - obs_q_pre_).norm();
     if (d <= tol) {
       RCLCPP_INFO(this->get_logger(), "[expl_view] reached q_pre: d=%.3f m (<= %.2f)", d, tol);
+
+      // --- q_pre checkpoint re-evaluation (ONCE, not continuous) --------------
+      // LiDAR gathered during the q_pre approach may have resolved the unknown or
+      // shifted the best vantage. Before committing to the STORED q_vis, re-check
+      // against the LATEST map + matched frontier record using the SAME v3 logic.
+      // This runs exactly once because we transition to APPROACH_Q right after.
+      const double same_tol = par_.expl_viewpoint.arrival_tol_m;
+      const FrontierRecord* rec =
+          frontier_manager_ ? frontier_manager_->find(obs_frontier_id_) : nullptr;
+      if (rec == nullptr ||
+          (rec->state != FrontierState::ACTIVE && rec->state != FrontierState::DORMANT)) {
+        RCLCPP_INFO(this->get_logger(),
+          "[viewpoint] reached q_pre; frontier gone/inactive -> returning to frontier selection");
+        endViewpointObservation();
+        exploration_active_ = false;
+        return true;
+      }
+      const mighty::GridQuery gq = buildViewpointGridQuery();
+      const std::vector<Eigen::Vector2d> U =
+          mighty::computeFirstUnknownTargets(rec->centroid_xy, rec->geometry, gq,
+                                             par_.expl_viewpoint);
+      if (U.empty()) {
+        // (3) the relevant unknown is already resolved -> abandon this maneuver.
+        RCLCPP_INFO(this->get_logger(),
+          "[viewpoint] reached q_pre; target already resolved -> returning to frontier selection");
+        endViewpointObservation();
+        exploration_active_ = false;
+        return true;
+      }
+      // (4) unknown remains -> recompute the best q_vis from the CURRENT pose+map.
+      // Exclude the current in-progress q_vis from the blacklist so the selector may
+      // legitimately re-pick it if it is still best; all genuinely-failed viewpoints
+      // stay blacklisted (preserving the existing attempted-viewpoint logic).
+      std::vector<Eigen::Vector2d> attempted_excl;
+      attempted_excl.reserve(obs_attempted_pos_.size());
+      for (const auto& a : obs_attempted_pos_)
+        if ((a - obs_q_).norm() > same_tol) attempted_excl.push_back(a);
+      const mighty::ViewpointResult vp =
+          mighty::selectViewpointLocal(rec->centroid_xy, rec->geometry, p, gq,
+                                       par_.expl_viewpoint, blind_mask_, U, attempted_excl);
+      if (vp.ok && (vp.q - obs_q_).norm() > same_tol) {
+        // q_vis changed -> adopt the new viewpoint (pose/yaw), blacklist it, and re-snapshot
+        // the reveal strip from the current map. We drive directly to the new q_vis from the
+        // current (old q_pre) pose; no second q_pre re-approach, to avoid checkpoint looping.
+        RCLCPP_INFO(this->get_logger(),
+          "[viewpoint] reached q_pre; recomputed q_vis old=(%.2f,%.2f) new=(%.2f,%.2f)",
+          obs_q_.x(), obs_q_.y(), vp.q.x(), vp.q.y());
+        obs_q_   = vp.q;
+        obs_yaw_ = vp.yaw;
+        obs_attempted_pos_.push_back(vp.q);
+        obs_strip_snapshot_ =
+            mighty::snapshotTargetStripUnknown(rec->centroid_xy, rec->geometry, gq,
+                                               par_.expl_viewpoint);
+      }
+      // else: no fresh candidate, or effectively the same q_vis -> continue to stored q_vis.
+
       issueViewpointGoal(obs_q_, obs_yaw_);  // stage 2: the q_pre->q* leg sets the heading
       obs_phase_ = ObsPhase::APPROACH_Q;
     }
