@@ -203,7 +203,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_frontier_manager
     src/test/test_frontier_manager.cpp
     src/mighty/frontier_detector.cpp
-    src/mighty/frontier_manager.cpp)
+    src/mighty/frontier_manager.cpp
+    src/mighty/frontier_viewpoint.cpp)
   ament_target_dependencies(test_frontier_manager
     rclcpp Eigen3 nav_msgs)
 
