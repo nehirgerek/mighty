@@ -374,7 +374,7 @@ mighty_node:
         exploration.viewpoint.lateral_step_m: 0.15
         exploration.viewpoint.max_lateral_offset_m: 1.50
         exploration.viewpoint.footprint_margin_m: 0.10
-        exploration.viewpoint.min_esdf_clearance_m: 0.70
+        exploration.viewpoint.min_esdf_clearance_m: 0.30
         exploration.viewpoint.pca_min_anisotropy: 1.5
         exploration.viewpoint.normal_probe_m: 0.30
         exploration.viewpoint.target_depths_m: [0.25, 0.40, 0.55, 0.70]
