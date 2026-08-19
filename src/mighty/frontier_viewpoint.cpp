@@ -600,6 +600,15 @@ ViewpointResult selectViewpointLocal(const Eigen::Vector2d& C, const FrontierGeo
         const Eigen::Vector2d q_pre = q - P.pre_viewpoint_len_m * Eigen::Vector2d(cpsi, spsi);
         if (!footprintFree(q_pre, grid, P)) continue;
         if (!segmentFootprintSafe(q_pre, q, grid, P)) continue;
+        // Hard obstacle-clearance floor at q_pre: footprintFree only guarantees
+        // rFootprint + footprint_margin_m, so q_pre could still hug an obstacle. Require
+        // ESDF distance >= min_esdf_clearance_m when ESDF is available (degrades to no-op
+        // if it isn't). This keeps the pre-viewpoint off walls/curbs, not just collision-free.
+        if (P.min_esdf_clearance_m > 0.0 && grid.esdfInBounds && grid.esdfDistance &&
+            grid.esdfInBounds(q_pre.x(), q_pre.y()) &&
+            grid.esdfDistance(q_pre.x(), q_pre.y()) < P.min_esdf_clearance_m) {
+          continue;
+        }
 
         Cand c;
         c.q = q; c.q_pre = q_pre; c.psi = psi; c.dpsi = std::abs(off_deg);

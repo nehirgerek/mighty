@@ -325,6 +325,7 @@ class MIGHTY_NODE : public rclcpp::Node {
   mighty::BlindMask blind_mask_;                     // cached near-ground blind boundary
   Eigen::Matrix3d   blind_mask_R_ = Eigen::Matrix3d::Identity();  // extrinsic the mask was built for
   bool     obs_prepath_checked_ = false;             // Step 9: this attempt's route validated?
+  bool     obs_qpre_reevaluated_ = false;            // one-shot q_pre-checkpoint re-eval done?
   int      obs_plan_attempts_   = 0;                 // Step 9: routes validated this episode
   Eigen::Vector2d obs_q_{0.0, 0.0};
   Eigen::Vector2d obs_q_pre_{0.0, 0.0};
