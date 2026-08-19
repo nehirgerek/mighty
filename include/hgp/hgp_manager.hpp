@@ -255,6 +255,23 @@ class HGPManager {
    */
   void findClosestNonOccupiedPoint(const Vec3f& point, Vec3f& closest_non_occupied_point);
 
+  /** @brief Project a ground-robot goal outward to the nearest cell that keeps
+   *  >= buffer_m clearance from any non-free cell (endpoint clearance buffer).
+   *
+   *  Reads the UNCARVED base map (map_util_), NOT map_util_for_planning_ (which
+   *  solveHGP free2DCell-carves around the goal -- that would defeat the buffer).
+   *  If the goal is already clear, returns it unchanged. On failure (no 2D map,
+   *  clearance field not built, or no clear cell within the cap) returns false
+   *  and sets `projected` to the input goal so callers keep the raw goal.
+   *  @param goal Query goal in world coordinates.
+   *  @param buffer_m Required clearance [m].
+   *  @param search_radius_m Maximum outward search radius [m].
+   *  @param projected Output projected goal in world coordinates.
+   *  @return true if a projected cell was found (or the goal already cleared).
+   */
+  bool projectGoalToClearance(const Vec3f& goal, double buffer_m, double search_radius_m,
+                              Vec3f& projected);
+
   /** @brief Count the number of unknown cells in the current map.
    *  @return Number of unknown cells.
    */

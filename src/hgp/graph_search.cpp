@@ -9,6 +9,7 @@
 #include "hgp/graph_search.hpp"
 
 #include <cmath>
+#include <limits>
 
 using namespace mighty;
 using namespace termcolor;
@@ -173,6 +174,15 @@ bool GraphSearch::static_jps_plan(StatePtr& currNode_ptr, int max_expand, int st
   double best_h = currNode_ptr->h;
   reached_goal_ = false;  // set true only if the exact goal node is popped below
 
+  // Clearance-preferring fallback (2D ground-robot endpoint buffer): among all
+  // popped nodes, track the closest-to-goal one whose 2D clearance is >= the
+  // stop distance. The three fallback exits recover from this node when it
+  // exists, so a partial path never ENDS inside the endpoint buffer. Active only
+  // for the 2D ground-robot proxy (zDim_==1) with stop_distance_ > 0 (UAV /
+  // default disabled).
+  StatePtr best_clear_node = nullptr;
+  double best_clear_h = std::numeric_limits<double>::infinity();
+
   if (verbose_) {
     std::cout << "[GraphSearch] planner=\"" << global_planner_
               << "\" use_jps=" << (use_jps_ ? 1 : 0) << " use_heat=" << (use_heat_ ? 1 : 0)
@@ -188,14 +198,17 @@ bool GraphSearch::static_jps_plan(StatePtr& currNode_ptr, int max_expand, int st
         timeout_duration) {
       std::cerr << "astar_heat: timeout after " << expand_iteration
                 << " expansions, recovering partial path\n";
-      path_ = recoverPath(best_node, start_id);
+      // Prefer a node that satisfies the endpoint clearance buffer if one was
+      // seen; otherwise fall back to the closest-to-goal node (never a hard fail).
+      path_ = recoverPath(best_clear_node ? best_clear_node : best_node, start_id);
       return !path_.empty() && path_.size() > 1;
     }
 
     if (pq_.empty()) {
       std::cerr << "astar_heat: priority queue empty after " << expand_iteration
                 << " expansions, recovering partial path\n";
-      path_ = recoverPath(best_node, start_id);
+      // Prefer a clearance-satisfying node if one was seen (endpoint buffer).
+      path_ = recoverPath(best_clear_node ? best_clear_node : best_node, start_id);
       return !path_.empty() && path_.size() > 1;
     }
 
@@ -208,6 +221,13 @@ bool GraphSearch::static_jps_plan(StatePtr& currNode_ptr, int max_expand, int st
     if (currNode_ptr->h < best_h) {
       best_h = currNode_ptr->h;
       best_node = currNode_ptr;
+    }
+
+    // Update best clearance-satisfying node (2D ground robot only).
+    if (zDim_ == 1 && stop_distance_ > 0.0 && currNode_ptr->h < best_clear_h &&
+        map_util_->getClearance2D(currNode_ptr->x, currNode_ptr->y) >= stop_distance_) {
+      best_clear_h = currNode_ptr->h;
+      best_clear_node = currNode_ptr;
     }
 
     if (currNode_ptr->id == goal_id) {
@@ -265,7 +285,8 @@ bool GraphSearch::static_jps_plan(StatePtr& currNode_ptr, int max_expand, int st
     if (max_expand > 0 && expand_iteration >= max_expand) {
       std::cerr << "astar_heat: max_expand [" << max_expand
                 << "] reached, recovering partial path\n";
-      path_ = recoverPath(best_node, start_id);
+      // Prefer a clearance-satisfying node if one was seen (endpoint buffer).
+      path_ = recoverPath(best_clear_node ? best_clear_node : best_node, start_id);
       return !path_.empty() && path_.size() > 1;
     }
   }

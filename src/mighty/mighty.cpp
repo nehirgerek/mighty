@@ -719,7 +719,9 @@ std::tuple<bool, bool> MIGHTY::replan(double last_replaning_computation_time, do
   // Get states we need
   state local_state, local_G_term, last_plan_state;
   getState(local_state);
-  getGterm(local_G_term);
+  // Endpoint clearance buffer: use the PROJECTED terminal goal so needReplan
+  // measures distance to the reachable stop point (ground robot; no-op otherwise).
+  getGtermProjected(local_G_term);
   getLastPlanState(last_plan_state);
 
   // Re-run goal sanitization each replan: as the planning window slides
@@ -809,7 +811,9 @@ bool MIGHTY::generateGlobalPath(vec_Vecf<3>& global_path, double current_time,
   // Get G and G_term
   state local_G, local_G_term;
   getG(local_G);
-  getGterm(local_G_term);
+  // Endpoint clearance buffer: feed the PROJECTED terminal goal into computeG /
+  // A* so the planned path ends at the stop point (ground robot; no-op otherwise).
+  getGtermProjected(local_G_term);
 
   // Declare local variables
   state local_A;
@@ -1303,6 +1307,38 @@ bool MIGHTY::appendToPlan() {
 void MIGHTY::getGterm(state& G_term) {
   std::lock_guard<std::mutex> lock(mtx_G_term_);
   G_term = G_term_;
+}
+
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief Gets the terminal goal projected outward to satisfy the endpoint
+ *        clearance buffer (path never ends within hgp_stop_distance_m of a
+ *        non-free cell). Ground-robot only; returns the raw goal otherwise.
+ * @param state &G_term_out: Output (possibly projected) terminal goal.
+ */
+void MIGHTY::getGtermProjected(state& G_term_out) {
+  // Start from the raw stored terminal goal.
+  getGterm(G_term_out);
+
+  // Endpoint clearance buffer is ground-robot-only and opt-in via
+  // hgp_stop_distance_m (default 0 => disabled, UAV untouched). Deliberately
+  // NOT gated on relocate_occupied_goal -- that is a separate mechanism.
+  if (par_.vehicle_type != "ground_robot" || par_.hgp_stop_distance_m <= 0.0) return;
+
+  // Project the goal outward to the nearest cell that keeps >= stop-distance
+  // clearance from any non-free cell (occupied / large-unknown / OOB), so the
+  // planned path never ENDS inside the buffer. Read on the UNCARVED base map.
+  // If already clear, disabled, or no clear cell within the search cap, keep the
+  // raw goal UNCHANGED (never drop it). We do NOT setGterm() the projection:
+  // G_term_ stays the raw click so it re-projects each cycle and un-projects as
+  // unknown space resolves.
+  const double kSearchRadiusM = 3.0;  // search cap for outward projection [m]
+  Vec3f projected;
+  if (hgp_manager_.projectGoalToClearance(G_term_out.pos, par_.hgp_stop_distance_m, kSearchRadiusM,
+                                          projected)) {
+    G_term_out.pos = projected;
+  }
 }
 
 // ----------------------------------------------------------------------------

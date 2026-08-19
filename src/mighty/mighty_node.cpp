@@ -1605,12 +1605,15 @@ void MIGHTY_NODE::replanCallback() {
   auto [replanning_result, hgp_result] =
       mighty_ptr_->replan(replanning_computation_time_, current_time);
 
-  // Republish the terminal goal marker so RViz tracks any in-replan
-  // relocation done by sanitizeTerminalGoal (e.g. when an obstacle gets
-  // sensed after the original click and the goal jumps to a clear cell).
-  if (par_.relocate_occupied_goal) {
+  // Republish the terminal goal marker so RViz tracks any in-replan relocation
+  // done by sanitizeTerminalGoal (relocate_occupied_goal) AND, for ground robots
+  // with an endpoint clearance buffer, the projected stop point -- so the
+  // operator sees where the robot will actually stop (getGtermProjected returns
+  // the raw goal when projection is disabled or unnecessary).
+  if (par_.relocate_occupied_goal ||
+      (par_.vehicle_type == "ground_robot" && par_.hgp_stop_distance_m > 0.0)) {
     state gterm_now;
-    mighty_ptr_->getGterm(gterm_now);
+    mighty_ptr_->getGtermProjected(gterm_now);
     publishState(gterm_now, pub_point_G_term_);
   }
 

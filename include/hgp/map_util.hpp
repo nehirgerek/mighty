@@ -27,6 +27,7 @@
 
 #include "hgp/data_type.hpp"
 
+#include "hgp/clearance_2d.hpp"
 #include "timer.hpp"
 #include <mighty/esdf_grid_2d.hpp>
 #include <mighty/occ_grid_2d.hpp>
@@ -96,6 +97,14 @@ class MapUtil {
         // 2D ground robot map data
         map_2d_(other.map_2d_),
         heat_2d_(other.heat_2d_),
+        // CRITICAL: the 2D clearance field MUST be copied here. HGPManager
+        // deep-copies map_util_ into map_util_for_planning_ via this ctor; any
+        // new vector member omitted arrives EMPTY in the planning copy, so
+        // getClearance2D would read 0 everywhere and every clearance-gated path
+        // would collapse. Keep these next to heat_2d_ (declaration order below
+        // matches this init order).
+        clearance_2d_(other.clearance_2d_),
+        clearance_2d_max_(other.clearance_2d_max_),
         terrain_cost_(other.terrain_cost_),
         col_min_height_(other.col_min_height_),
         col_max_height_(other.col_max_height_),
@@ -1651,6 +1660,10 @@ class MapUtil {
 
   std::vector<int8_t> map_2d_;         // 2D occupancy grid (dimX * dimY)
   std::vector<float> heat_2d_;         // 2D static heat (dimX * dimY)
+  // Endpoint clearance buffer support (ground robot). Declared next to heat_2d_
+  // and copied in the same relative slot of the copy ctor above (init order).
+  std::vector<float> clearance_2d_;    // [m] distance to nearest non-free cell, truncated
+  float clearance_2d_max_ = 0.0f;      // truncation sentinel [m]
   std::vector<float> terrain_cost_;    // 2D terrain gradient cost (dimX * dimY)
   std::vector<float> col_min_height_;  // Per-column min occupied z in world coords
   std::vector<float> col_max_height_;  // Per-column max occupied z in world coords
@@ -1852,6 +1865,51 @@ class MapUtil {
     const int dimY = dim_(1);
     if (x < 0 || x >= dimX || y < 0 || y >= dimY) return val_occ_;
     return map_2d_[static_cast<size_t>(x) + static_cast<size_t>(dimX) * y];
+  }
+
+  /** @brief Build the 2D endpoint-clearance field [m] over the current 2D map.
+   *
+   *  8-connected truncated wavefront: clearance = distance to the nearest
+   *  non-free cell. Seeds every non-free cell (occupied or large-unknown, the
+   *  2D map is binary) AND the border ring, so OOB reads clearance 0 (matching
+   *  get2DOccupancy's conservative OOB). Thin wrapper over the free-function
+   *  computeClearanceField2D so the wavefront is unit-testable without a MapUtil.
+   *  @param max_dist_m Truncation distance [m].
+   */
+  void buildClearance2D(double max_dist_m) {
+    if (!has_2d_map_) {
+      clearance_2d_.clear();
+      clearance_2d_max_ = 0.0f;
+      return;
+    }
+    const int dimX = dim_(0);
+    const int dimY = dim_(1);
+    clearance_2d_max_ = static_cast<float>(max_dist_m);
+    clearance_2d_ =
+        computeClearanceField2D(dimX, dimY, res_, map_2d_.data(), max_dist_m, val_free_);
+  }
+
+  /** @brief Query the 2D clearance field [m]. Returns 0 when OOB or field empty. */
+  float getClearance2D(int x, int y) const {
+    if (clearance_2d_.empty()) return 0.0f;
+    const int dimX = dim_(0);
+    const int dimY = dim_(1);
+    if (x < 0 || x >= dimX || y < 0 || y >= dimY) return 0.0f;
+    return clearance_2d_[static_cast<size_t>(x) + static_cast<size_t>(dimX) * y];
+  }
+
+  /** @brief Project a 2D goal cell outward to the nearest cell whose clearance
+   *  is >= buffer_m, capped at search_radius_m. Thin wrapper over the
+   *  free-function projectToClearance2D. Returns true and writes (out_x,out_y)
+   *  on success (including "already clear" -> input cell); false otherwise.
+   *  Reads the map's own clearance_2d_ (caller decides which map instance). */
+  bool projectGoalToClearance2D(int gx, int gy, double buffer_m, double search_radius_m,
+                                int& out_x, int& out_y) const {
+    if (!has_2d_map_ || clearance_2d_.empty()) return false;
+    const int dimX = dim_(0);
+    const int dimY = dim_(1);
+    return projectToClearance2D(dimX, dimY, res_, clearance_2d_.data(), gx, gy, buffer_m,
+                                search_radius_m, out_x, out_y);
   }
 
   /** @brief Get terrain gradient cost at grid coordinates. */

@@ -117,6 +117,19 @@ class MIGHTY {
    */
   void getGterm(state& G_term);
 
+  /** @brief Get the terminal goal, projected outward so the planned path never
+   *  ENDS within hgp_stop_distance_m of a non-free cell (ground robot only).
+   *
+   *  Fetches the raw stored goal via getGterm(), then (for ground robots with
+   *  hgp_stop_distance_m > 0) projects it to the nearest cell with sufficient
+   *  clearance. If already clear, disabled, or no clear cell is found within the
+   *  search cap, returns the raw goal UNCHANGED. Does NOT setGterm() the
+   *  projection: G_term_ stays the raw click so it re-projects every cycle and
+   *  un-projects as unknown space resolves.
+   *  @param G_term_out Output (possibly projected) terminal goal.
+   */
+  void getGtermProjected(state& G_term_out);
+
   /** @brief Set the terminal goal state (thread-safe).
    *  @param G_term New terminal goal.
    */

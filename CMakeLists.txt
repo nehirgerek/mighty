@@ -185,6 +185,14 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_occ_grid_2d_unknown
     rclcpp Eigen3 nav_msgs)
 
+  # 2D endpoint-clearance field + goal projection free functions. These are
+  # header-only (include/hgp/clearance_2d.hpp) with no external deps, so the test
+  # needs no MapUtil/PCL -- Eigen3 is listed only to mirror the sibling test.
+  ament_add_gtest(test_clearance_2d
+    src/test/test_clearance_2d.cpp)
+  ament_target_dependencies(test_clearance_2d
+    Eigen3)
+
   ament_add_gtest(test_frontier_detector
     src/test/test_frontier_detector.cpp
     src/mighty/frontier_detector.cpp)

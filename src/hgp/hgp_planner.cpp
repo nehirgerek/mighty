@@ -442,6 +442,9 @@ bool HGPPlanner::plan(const Vecf<3>& start, const Vecf<3>& start_vel, const Vecf
                                                         zDim_for_search, eps, planner_verbose_,
                                                         global_planner_, w_unknown_);
   graph_search_->setStartAndGoal(start, goal);
+  // Forward the endpoint clearance buffer so fallback paths prefer a
+  // clearance-satisfying node (ground robot 2D; 0 disables).
+  graph_search_->setStopDistance(stop_distance_);
   double max_values[3] = {v_max_, a_max_, j_max_};
   graph_search_->setBounds(max_values);
 

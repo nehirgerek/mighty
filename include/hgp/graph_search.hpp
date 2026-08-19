@@ -245,6 +245,11 @@ class GraphSearch {
    */
   void setBounds(double max_values[3]);
 
+  /** @brief Set the endpoint clearance buffer [m] used to bias fallback path
+   *  recovery toward the closest-to-goal node that keeps >= d clearance
+   *  (2D ground-robot proxy zDim_==1 only). 0 disables. */
+  void setStopDistance(double d) { stop_distance_ = d; }
+
  private:
   /// Select planner
   bool select_planner(StatePtr& currNode_ptr, int max_expand, int start_id, int goal_id,
@@ -329,6 +334,10 @@ class GraphSearch {
   // Set true only when the exact goal node is popped; false on any best_node
   // fallback (timeout / empty open set / max_expand). Read via reachedGoal().
   bool reached_goal_ = false;
+
+  // Endpoint clearance buffer [m] for the 2D ground-robot fallback (see
+  // best_clear_node in static_jps_plan). 0 disables. Set via setStopDistance().
+  double stop_distance_ = 0.0;
 
   priorityQueue pq_;
   std::vector<StatePtr> hm_;

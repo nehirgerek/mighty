@@ -128,6 +128,10 @@ void HGPManager::setupHGPPlanner(const std::string& global_planner, bool global_
   // Best-effort toward occupied goals (see parameters::allow_occupied_goal).
   planner_ptr_->setAllowOccupiedGoal(par_.allow_occupied_goal);
 
+  // Endpoint clearance buffer: bias A* fallback recovery toward nodes that keep
+  // >= hgp_stop_distance_m clearance (ground robot 2D; 0 disables, UAV default).
+  planner_ptr_->setStopDistance(par_.hgp_stop_distance_m);
+
   // Enable 2D A* mode only when use_2d_planning is on
   planner_ptr_->set2DMode(is_ground_robot_ && par_.use_2d_planning);
 
@@ -323,37 +327,38 @@ bool HGPManager::solveHGP(const Vec3f& start_sent, const Vec3f& start_vel, const
     }
   }
 
-  // Safety stand-off for ground robots on A* FALLBACK paths only. When A* could
-  // not reach the goal it returns a partial path ending at best_node, which sits
-  // one cell from a (conservative UNKNOWN->OCCUPIED) wall in the planning map --
-  // so the robot would drive right up to the obstacle and park there. Back off
-  // the path TAIL until the last waypoint keeps >= hgp_stop_distance_m clearance
-  // from any occupied cell. Skipped when A* reached the actual goal (a real goal
-  // near a wall is never trimmed) and when hgp_stop_distance_m <= 0 (default).
+  // Endpoint clearance buffer backstop for ground robots. The returned path must
+  // never END within hgp_stop_distance_m of a non-free cell (occupied,
+  // large-unknown, or out-of-bounds). Back off the path TAIL until the last
+  // waypoint clears the buffer. Runs on ALL ground-robot paths -- whether or not
+  // A* reached the exact goal -- because the endpoint buffer applies regardless
+  // of goal arrival (the goal was already projected outward in Layer 2; this is
+  // the safety net for cases projection/A* could not fully satisfy). Clearance
+  // is read directly (O(1)) from clearance_2d_ on map_util_for_planning_: this
+  // is the returned path, and matches the planning-map source the previous
+  // disc-scan used. Skipped when hgp_stop_distance_m <= 0 (default / UAV).
   if (is_ground_robot_ && map_util_for_planning_->has2DMap() &&
-      par_.hgp_stop_distance_m > 0.0 && path.size() > 1 &&
-      !planner_ptr_->reachedGoal()) {
-    const double res = map_util_for_planning_->getRes();
-    const int r = std::max(1, static_cast<int>(std::ceil(par_.hgp_stop_distance_m / res)));
-    const int r2 = r * r;
+      par_.hgp_stop_distance_m > 0.0 && path.size() > 1) {
     auto tooCloseToObstacle = [&](const Vecf<3>& wp) {
       const Veci<3> pi = map_util_for_planning_->floatToInt(wp);
-      for (int dy = -r; dy <= r; ++dy) {
-        for (int dx = -r; dx <= r; ++dx) {
-          if (dx * dx + dy * dy > r2) continue;
-          // get2DOccupancy() returns occupied for out-of-bounds too (conservative).
-          if (map_util_for_planning_->get2DOccupancy(pi(0) + dx, pi(1) + dy) != 0)
-            return true;
-        }
-      }
-      return false;
+      // getClearance2D() returns 0 for out-of-bounds too (conservative, matches
+      // get2DOccupancy). Direct field lookup replaces the O(r^2) disc scan.
+      return map_util_for_planning_->getClearance2D(pi(0), pi(1)) < par_.hgp_stop_distance_m;
     };
     const size_t before = path.size();
-    while (path.size() > 1 && tooCloseToObstacle(path.back())) path.pop_back();
+    // Keep a floor of 2 points: planLocalTrajectory fails on size() < 2, so we
+    // never trim below 2 even if the stub still violates the buffer.
+    while (path.size() > 2 && tooCloseToObstacle(path.back())) path.pop_back();
     if (path.size() < before) {
-      std::cout << "[HGP] safety stand-off: backed off " << (before - path.size())
-                << " tail waypoint(s) (stop_distance=" << par_.hgp_stop_distance_m
-                << " m) on A* fallback path" << std::endl;
+      std::cout << "[HGP] endpoint clearance: backed off " << (before - path.size())
+                << " tail waypoint(s) (stop_distance=" << par_.hgp_stop_distance_m << " m)"
+                << std::endl;
+    }
+    // Warn if even the retained stub still violates the clearance buffer.
+    if (tooCloseToObstacle(path.back())) {
+      std::cout << "[HGP] endpoint clearance: WARNING path still ends within "
+                << par_.hgp_stop_distance_m
+                << " m of a non-free cell (path too short to trim further)" << std::endl;
     }
   }
 
@@ -1261,6 +1266,18 @@ void HGPManager::updateMap(double wdx, double wdy, double wdz, const Vec3f& cent
                                   par_.terrain_cost_mode, par_.use_column_any_occupied,
                                   static_cast<float>(par_.column_min_z));
     }
+
+    // Build the 2D endpoint-clearance field on the UNCARVED base map, once per
+    // map update. Consumed by goal projection (Layer 2), the A* clearance-
+    // preferring best_node (Layer 3), and the tail-trim backstop (Layer 4) to
+    // enforce the endpoint clearance buffer. Gated on hgp_stop_distance_m > 0
+    // (default 0 => disabled; UAV never enters this ground-robot block anyway).
+    // Truncate one cell past the buffer so getClearance2D >= buffer resolves at
+    // the boundary. NOTE: this field is carried into map_util_for_planning_ by
+    // MapUtil's copy ctor (see setupHGPPlanner) -- do NOT recompute it there.
+    if (par_.hgp_stop_distance_m > 0.0) {
+      map_util_->buildClearance2D(par_.hgp_stop_distance_m + res_);
+    }
   }
   mtx_map_util_.unlock();
 
@@ -1295,6 +1312,30 @@ void HGPManager::findClosestNonOccupiedPoint(const Vec3f& point,
     closest_non_occupied_point = point;
   }
   mtx_map_util_.unlock();
+}
+
+bool HGPManager::projectGoalToClearance(const Vec3f& goal, double buffer_m,
+                                        double search_radius_m, Vec3f& projected) {
+  projected = goal;  // default: leave the raw goal unchanged
+  std::lock_guard<std::mutex> lock(mtx_map_util_);
+  // Read the UNCARVED base map (NOT map_util_for_planning_): solveHGP carves
+  // obstacles around the goal in the planning copy, which would report false
+  // clearance and defeat the endpoint buffer.
+  if (!map_util_ || !map_util_->has2DMap()) return false;
+
+  const Veci<3> gi = map_util_->floatToInt(goal);
+  int ox = 0, oy = 0;
+  if (!map_util_->projectGoalToClearance2D(gi(0), gi(1), buffer_m, search_radius_m, ox, oy)) {
+    return false;
+  }
+
+  // Convert the projected cell center back to world coordinates; keep goal z.
+  const auto origin = map_util_->getOrigin();
+  const double res = map_util_->getRes();
+  projected(0) = static_cast<float>(origin(0) + (ox + 0.5) * res);
+  projected(1) = static_cast<float>(origin(1) + (oy + 0.5) * res);
+  projected(2) = goal(2);
+  return true;
 }
 
 int HGPManager::countUnknownCells() const { return map_util_for_planning_->countUnknownCells(); }

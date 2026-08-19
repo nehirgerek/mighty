@@ -162,6 +162,10 @@ class HGPPlanner {
    */
   void setAllowOccupiedGoal(bool enabled) { allow_occupied_goal_ = enabled; }
 
+  /** @brief Set the endpoint clearance buffer [m] forwarded to GraphSearch so
+   *  fallback paths prefer a node keeping >= d clearance (ground robot 2D). */
+  void setStopDistance(double d) { stop_distance_ = d; }
+
   /** @brief Shorten a path using line-of-sight checks with inflated capsule collision tests.
    *  @param in Input waypoint path.
    *  @param inflate_radius_cells Inflation radius in voxel cells.
@@ -208,6 +212,8 @@ class HGPPlanner {
   bool last_reached_goal_ = false;
   // If true, an occupied goal cell is not rejected; A* plans best-effort toward it.
   bool allow_occupied_goal_ = false;
+  // Endpoint clearance buffer [m] forwarded to GraphSearch (0 = disabled).
+  double stop_distance_ = 0.0;
   // Enabled for printing info
   bool planner_verbose_;
 
