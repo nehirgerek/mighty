@@ -4214,7 +4214,7 @@ void MIGHTY_NODE::publishFrontierMarkers() {
     arr.markers.push_back(label);
   }
 
-  // --- Viewpoint debug: chosen q_vis (green) and q_pre (cyan) ---------------
+  // --- Viewpoint debug: chosen q_vis (green) and q_pre (pink) ---------------
   // Published on the SAME exploration/frontiers topic (distinct namespaces/
   // colors) only while a viewpoint observation is in progress. The DELETEALL
   // prefix at the top of this function clears them automatically once
@@ -4239,7 +4239,7 @@ void MIGHTY_NODE::publishFrontierMarkers() {
       return m;
     };
     arr.markers.push_back(vpSphere(obs_q_,     "viewpoint_qvis", 0.1, 1.0, 0.1));  // green = q_vis
-    arr.markers.push_back(vpSphere(obs_q_pre_, "viewpoint_qpre", 0.1, 0.6, 1.0));  // cyan  = q_pre
+    arr.markers.push_back(vpSphere(obs_q_pre_, "viewpoint_qpre", 1.0, 0.08, 0.58));  // pink = q_pre
     // Connecting leg q_pre -> q_vis (the executed approach direction).
     visualization_msgs::msg::Marker leg;
     leg.header.frame_id = par_.map_frame_id;
@@ -4249,7 +4249,7 @@ void MIGHTY_NODE::publishFrontierMarkers() {
     leg.type = visualization_msgs::msg::Marker::LINE_STRIP;
     leg.action = visualization_msgs::msg::Marker::ADD;
     leg.scale.x = 0.05;
-    leg.color = makeColor(0.1, 0.8, 1.0, 0.9);
+    leg.color = makeColor(1.0, 0.08, 0.58, 0.9);  // pink
     leg.pose.orientation.w = 1.0;
     geometry_msgs::msg::Point pa, pb;
     pa.x = obs_q_pre_.x(); pa.y = obs_q_pre_.y(); pa.z = zv;
