@@ -4147,6 +4147,51 @@ void MIGHTY_NODE::publishFrontierMarkers() {
     arr.markers.push_back(label);
   }
 
+  // --- Viewpoint debug: chosen q_vis (green) and q_pre (cyan) ---------------
+  // Published on the SAME exploration/frontiers topic (distinct namespaces/
+  // colors) only while a viewpoint observation is in progress. The DELETEALL
+  // prefix at the top of this function clears them automatically once
+  // obs_phase_ returns to IDLE, so no stale markers linger.
+  if (obs_phase_ != ObsPhase::IDLE) {
+    const double zv = par_.expl_default_goal_z + 0.20;
+    auto vpSphere = [&](const Eigen::Vector2d& p, const std::string& ns,
+                        double cr, double cg, double cb) {
+      visualization_msgs::msg::Marker m;
+      m.header.frame_id = par_.map_frame_id;
+      m.header.stamp    = this->now();
+      m.ns   = ns;
+      m.id   = 0;
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.pose.position.x = p.x();
+      m.pose.position.y = p.y();
+      m.pose.position.z = zv;
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = m.scale.z = 0.35;
+      m.color = makeColor(cr, cg, cb, 0.95);
+      return m;
+    };
+    arr.markers.push_back(vpSphere(obs_q_,     "viewpoint_qvis", 0.1, 1.0, 0.1));  // green = q_vis
+    arr.markers.push_back(vpSphere(obs_q_pre_, "viewpoint_qpre", 0.1, 0.6, 1.0));  // cyan  = q_pre
+    // Connecting leg q_pre -> q_vis (the executed approach direction).
+    visualization_msgs::msg::Marker leg;
+    leg.header.frame_id = par_.map_frame_id;
+    leg.header.stamp    = this->now();
+    leg.ns   = "viewpoint_leg";
+    leg.id   = 0;
+    leg.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    leg.action = visualization_msgs::msg::Marker::ADD;
+    leg.scale.x = 0.05;
+    leg.color = makeColor(0.1, 0.8, 1.0, 0.9);
+    leg.pose.orientation.w = 1.0;
+    geometry_msgs::msg::Point pa, pb;
+    pa.x = obs_q_pre_.x(); pa.y = obs_q_pre_.y(); pa.z = zv;
+    pb.x = obs_q_.x();     pb.y = obs_q_.y();     pb.z = zv;
+    leg.points.push_back(pa);
+    leg.points.push_back(pb);
+    arr.markers.push_back(leg);
+  }
+
   pub_frontiers_->publish(arr);
 }
 
